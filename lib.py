@@ -29,12 +29,18 @@ def get_supabase():
 
 
 def fetch_stories():
-    """Fetch stories from Supabase for dropdown."""
+    """Fetch all stories from Supabase for dropdown."""
     sb = get_supabase()
     if not sb:
         return []
     try:
-        r = sb.table("stories").select("id, title, description").order("created_at", desc=True).execute()
+        r = (
+            sb.table("stories")
+            .select("id, title, description")
+            .order("created_at", desc=True)
+            .limit(1000)
+            .execute()
+        )
         return r.data or []
     except Exception as e:
         st.error(f"Failed to fetch stories: {e}")

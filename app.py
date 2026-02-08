@@ -448,68 +448,68 @@ def main():
         st.info("Click Add Page to get started.")
 
     # --- Image Controls ---
-    st.header("4. Image Style Controls")
-    age_appropriateness = st.text_input(
-        "Age appropriateness",
-        placeholder="e.g. Pre-school (3–5), Early reader (5–6 yrs)",
-        key="age_appropriateness",
-    )
-    style_prompt = st.text_area(
-        "Global style prompt",
-        placeholder="e.g. watercolor illustration, children's book style, whimsical",
-        key="style_prompt",
-    )
-    character_ref = st.text_input(
-        "Character / appearance reference (optional)",
-        placeholder="e.g. young girl with red hair, wears blue dress",
-        key="character_ref",
-    )
-    color_palette = st.text_input(
-        "Color palette (optional)",
-        placeholder="e.g. warm earth tones, muted blues",
-        key="color_palette",
-    )
-    lighting = st.text_input(
-        "Lighting Mood",
-        placeholder="e.g. Soft overcast light",
-        key="lighting",
-    )
-    framing = st.text_input(
-        "Framing",
-        placeholder="e.g. Medium shot, warm composition",
-        key="framing",
-    )
-    ref_file = st.file_uploader(
-        "Reference image for character consistency (optional)",
-        type=["png", "jpg", "jpeg"],
-        key="ref_image",
-        help="Upload a sample image, or select an approved page below.",
-    )
-    approved_with_images = [
-        (i, p) for i, p in enumerate(st.session_state.pages)
-        if p.get("image") and p.get("status") == "approved"
-    ]
-    ref_page_options = ["None"] + [f"Page {i}" for i, _ in approved_with_images]
-    ref_page_labels = {f"Page {i}": i for i, _ in approved_with_images}
-    # Persist selection: only reset if saved value is no longer valid
-    saved = st.session_state.ref_selected_page
-    if saved not in ref_page_options:
-        st.session_state.ref_selected_page = "None"
-    default_idx = ref_page_options.index(st.session_state.ref_selected_page)
-    ref_selected = st.selectbox(
-        "Use approved page as reference",
-        options=ref_page_options,
-        index=default_idx,
-        key="ref_page_select",
-        help="Select an approved page image to use for character consistency.",
-    )
-    st.session_state.ref_selected_page = ref_selected
-    selected_ref_index = ref_page_labels.get(ref_selected) if ref_selected != "None" else None
-    style_preview = build_style_string(
-        age_appropriateness, style_prompt, character_ref, lighting, color_palette, framing
-    )
-    if style_preview:
-        st.caption(f"**Style (repeated every gen):** {style_preview[:150]}{'...' if len(style_preview) > 150 else ''}")
+    with st.expander("4. Image Style Controls"):
+        age_appropriateness = st.text_input(
+            "Age appropriateness",
+            placeholder="e.g. Pre-school (3–5), Early reader (5–6 yrs)",
+            key="age_appropriateness",
+        )
+        style_prompt = st.text_area(
+            "Global style prompt",
+            placeholder="e.g. watercolor illustration, children's book style, whimsical",
+            key="style_prompt",
+        )
+        character_ref = st.text_input(
+            "Character / appearance reference (optional)",
+            placeholder="e.g. young girl with red hair, wears blue dress",
+            key="character_ref",
+        )
+        color_palette = st.text_input(
+            "Color palette (optional)",
+            placeholder="e.g. warm earth tones, muted blues",
+            key="color_palette",
+        )
+        lighting = st.text_input(
+            "Lighting Mood",
+            placeholder="e.g. Soft overcast light",
+            key="lighting",
+        )
+        framing = st.text_input(
+            "Framing",
+            placeholder="e.g. Medium shot, warm composition",
+            key="framing",
+        )
+        ref_file = st.file_uploader(
+            "Reference image for character consistency (optional)",
+            type=["png", "jpg", "jpeg"],
+            key="ref_image",
+            help="Upload a sample image, or select an approved page below.",
+        )
+        approved_with_images = [
+            (i, p) for i, p in enumerate(st.session_state.pages)
+            if p.get("image") and p.get("status") == "approved"
+        ]
+        ref_page_options = ["None"] + [f"Page {i}" for i, _ in approved_with_images]
+        ref_page_labels = {f"Page {i}": i for i, _ in approved_with_images}
+        # Persist selection: only reset if saved value is no longer valid
+        saved = st.session_state.ref_selected_page
+        if saved not in ref_page_options:
+            st.session_state.ref_selected_page = "None"
+        default_idx = ref_page_options.index(st.session_state.ref_selected_page)
+        ref_selected = st.selectbox(
+            "Use approved page as reference",
+            options=ref_page_options,
+            index=default_idx,
+            key="ref_page_select",
+            help="Select an approved page image to use for character consistency.",
+        )
+        st.session_state.ref_selected_page = ref_selected
+        selected_ref_index = ref_page_labels.get(ref_selected) if ref_selected != "None" else None
+        style_preview = build_style_string(
+            age_appropriateness, style_prompt, character_ref, lighting, color_palette, framing
+        )
+        if style_preview:
+            st.caption(f"**Style (repeated every gen):** {style_preview[:150]}{'...' if len(style_preview) > 150 else ''}")
 
     # --- Generate & Review ---
     if st.session_state.pages:
