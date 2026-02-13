@@ -54,6 +54,14 @@ def get_session():
         return None
 
 
+def get_profile_id() -> str:
+    """Get current user's profile id (auth user id) for subscription/profiles lookups."""
+    session = get_session()
+    if not session or not session.user:
+        return ""
+    return str(session.user.id) if session.user.id else ""
+
+
 def is_authenticated() -> bool:
     """Check if user has a valid session."""
     return get_session() is not None
