@@ -536,6 +536,16 @@ def main():
         color_palette_val = defaults.get("color_palette", "")
         lighting_val = defaults.get("lighting", "")
         framing_val = defaults.get("framing", "")
+        # Force session_state for this level so widgets show the loaded values when user switches grade
+        # (On Cloud, widget keys persist and value= is ignored once the key exists; without this, changing level doesn't update the form.)
+        if st.session_state.get("ip_style_loaded_level") != reading_level:
+            st.session_state["ip_style_loaded_level"] = reading_level
+            st.session_state[f"ip_age_{reading_level}"] = age_appropriateness_val
+            st.session_state[f"ip_style_{reading_level}"] = style_prompt_val
+            st.session_state[f"ip_char_{reading_level}"] = character_ref_val
+            st.session_state[f"ip_color_{reading_level}"] = color_palette_val
+            st.session_state[f"ip_light_{reading_level}"] = lighting_val
+            st.session_state[f"ip_frame_{reading_level}"] = framing_val
     else:
         age_appropriateness_val = st.session_state.get("age_appropriateness", "")
         style_prompt_val = st.session_state.get("style_prompt", "")
