@@ -1,0 +1,46 @@
+---
+description: Supabase flattened story content - story_content_flat table, query pattern, and ordering
+globs: **/*.py
+alwaysApply: false
+---
+
+# story_content_flat — Flattened Story Content
+
+Context for **story_content_flat** table:
+
+All story content, including translations and multiple reading levels (versions), is consolidated into the **story_content_flat** table. This table replaces the old book_pages, localized_story_versions, and story_assets tables.
+
+## Key schema details
+
+- **Single source of truth**: story_content_flat is the only table needed for story pages (no joins).
+- **Primary query keys**: To fetch a specific book, filter by:
+  - `story_id`
+  - `reading_level` (e.g. `'grade_1'`)
+  - `language_code` (e.g. `'en'`)
+- **Ordering**: Always sort by **page_number** ascending to render the story in the correct sequence.
+- **Asset handling**: Each row contains the direct **image_url** and **text** (or page_text) for that page; no joins required.
+
+## How to query (Python/Supabase)
+
+```python
+# Fetch pages for a book
+r = (
+    supabase.table("story_content_flat")
+    .select("*")
+    .eq("story_id", story_id)
+    .eq("language_code", language_code)
+    .eq("reading_level", reading_level)
+    .order("page_number")  # ascending
+    .execute()
+)
+rows = r.data or []
+```
+
+## Other tables
+
+- **stories**: id, title, description.
+- **story_grade_styles**: story_id, reading_level, age_appropriateness, global_style, character_ref, color_palette, lighting, framing (per-story, per-grade style overrides).
+
+## Optional: RPC
+
+If you have a `get_story_page_data` RPC, it may wrap the same query. For the flattened schema, using the query above (or `lib.fetch_book_pages`) is sufficient.

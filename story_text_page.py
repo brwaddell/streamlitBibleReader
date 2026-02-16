@@ -10,6 +10,7 @@ from lib import (
     LANGUAGE_CODES,
     READING_LEVELS,
     delete_book_pages_for_version,
+    fetch_book_pages,
     fetch_stories,
     get_supabase,
     insert_book_page,
@@ -104,23 +105,78 @@ def run_story_text_view():
         "Save will replace all existing pages for this story + reading level + language with the split result. "
         "Existing images will be lost; run Image Processor to regenerate."
     )
+
+    # Confirmation when overwriting existing content
+    pending = st.session_state.get("st_save_confirm_pending") and st.session_state.get("st_save_confirm_data")
+    if pending:
+        data = st.session_state["st_save_confirm_data"]
+        levels_with_content = data.get("levels_with_content", [])
+        st.warning(
+            f"This story + language already has content for: **{', '.join(levels_with_content)}**. "
+            "Overwriting will replace all pages and remove existing images. Confirm to proceed."
+        )
+        col1, col2, _ = st.columns([1, 1, 2])
+        with col1:
+            if st.button("Confirm overwrite", type="primary", key="st_confirm_overwrite"):
+                sid = data["story_id"]
+                lang = data["language_code"]
+                levels_to_save = data["levels_to_save"]
+                segs = data["segments"]
+                total_saved = 0
+                for lev in levels_to_save:
+                    if delete_book_pages_for_version(sb, sid, lang, lev):
+                        for i, seg in enumerate(segs):
+                            if insert_book_page(sb, sid, lang, lev, i, seg, image_url=None):
+                                total_saved += 1
+                    else:
+                        st.error(f"Failed to delete existing pages for {lev}.")
+                        break
+                else:
+                    st.success(f"Saved {total_saved} pages to story_content_flat ({len(levels_to_save)} level(s)).")
+                    if "st_segments" in st.session_state:
+                        del st.session_state["st_segments"]
+                del st.session_state["st_save_confirm_pending"]
+                del st.session_state["st_save_confirm_data"]
+                st.rerun()
+        with col2:
+            if st.button("Cancel", key="st_cancel_overwrite"):
+                del st.session_state["st_save_confirm_pending"]
+                del st.session_state["st_save_confirm_data"]
+                st.rerun()
+        st.stop()
+
     save_clicked = st.button("Save to Supabase", type="primary", key="st_save")
     if save_clicked:
         if not segments:
             st.warning("Split the story first to get pages.")
         else:
             levels_to_save = READING_LEVELS if save_to_all_levels else [reading_level]
-            total_saved = 0
-            for lev in levels_to_save:
-                if delete_book_pages_for_version(sb, story_id, language_code, lev):
-                    for i, seg in enumerate(segments):
-                        if insert_book_page(sb, story_id, language_code, lev, i, seg, image_url=None):
-                            total_saved += 1
-                else:
-                    st.error(f"Failed to delete existing pages for {lev}.")
-                    break
-            else:
-                st.success(f"Saved {total_saved} pages to story_content_flat ({len(levels_to_save)} level(s)).")
-                if "st_segments" in st.session_state:
-                    del st.session_state["st_segments"]
+            levels_with_content = [
+                lev for lev in levels_to_save
+                if fetch_book_pages(sb, story_id, lev, language_code)
+            ]
+            if levels_with_content:
+                st.session_state["st_save_confirm_pending"] = True
+                st.session_state["st_save_confirm_data"] = {
+                    "story_id": story_id,
+                    "language_code": language_code,
+                    "levels_to_save": levels_to_save,
+                    "segments": segments,
+                    "levels_with_content": levels_with_content,
+                }
                 st.rerun()
+            else:
+                total_saved = 0
+                for lev in levels_to_save:
+                    if delete_book_pages_for_version(sb, story_id, language_code, lev):
+                        for i, seg in enumerate(segments):
+                            if insert_book_page(sb, story_id, language_code, lev, i, seg, image_url=None):
+                                total_saved += 1
+                    else:
+                        st.error(f"Failed to delete existing pages for {lev}.")
+                        break
+                else:
+                    st.success(f"Saved {total_saved} pages to story_content_flat ({len(levels_to_save)} level(s)).")
+                    if "st_segments" in st.session_state:
+                        del st.session_state["st_segments"]
+                    st.rerun()
