@@ -1,10 +1,10 @@
 """Shared utilities for Storybook Image Processor."""
 import base64
 import os
+import time
 from io import BytesIO
 from typing import List, Optional, Tuple
 
-import pandas as pd
 import requests
 import streamlit as st
 from PIL import Image
@@ -13,6 +13,20 @@ from auth import get_secret
 
 READING_LEVELS = ["grade_1", "grade_2", "grade_3", "grade_4", "grade_5"]
 LANGUAGE_CODES = ["en", "es", "fr"]  # Extend as needed
+
+# ElevenLabs voice options (name, voice_id, description) — shared by Audio Generator and Book Pages
+VOICES_MALE = [
+    ("Hale", "nzFihrBIvB34imQBuxub", "Warm, friendly"),
+    ("Johnny Kid", "8JVbfL6oEdmuxKn5DK2C", "Serious, calm narrator"),
+    ("David", "FF7KdobWPaiR0vkcALHF", "Deep, engaging"),
+    ("Father Christmas", "1wg2wOjdEWKA7yQD8Kca", "Magical storyteller"),
+]
+VOICES_FEMALE = [
+    ("Zara", "jqcCZkN6Knx8BJ5TBdYR", "Clear, natural"),
+    ("Amelia", "ZF6FPAbjXT4488VcRRnw", "Enthusiastic, expressive"),
+    ("Emma Taylor", "S9EGwlCtMF7VXtENq79v", "Gentle, thoughtful"),
+    ("Rachel", "21m00Tcm4TlvDq8ikWAM", "Professional, warm"),
+]
 STORAGE_BUCKET = "storybook-images"
 AUDIO_BUCKET = "storybook-audio"
 MAX_IMAGE_SIZE = 800
@@ -21,6 +35,233 @@ TARGET_BYTES = 100_000
 # Flattened story content table (replaces book_pages, localized_story_versions, story_assets)
 TABLE_STORY_CONTENT_FLAT = "story_content_flat"
 PAGE_NUMBER_COLUMN = "page_number"  # Always order by this ascending for correct story sequence
+
+# --- Image generation (Gemini); shared by Image Processor and Book Pages ---
+SYSTEM_INSTRUCTIONS = (
+    "You are a consistent storybook illustrator. CRITICAL: The main character must have the EXACT SAME face, hair, beard, and clothing in every image. "
+    "Use the provided character description as a fixed design—do not vary it. No creative reinterpretation of the character. "
+    "Quality: Standard. Aspect Ratio: 1024x1024. Never include text, words, or letters in the image. "
+)
+
+
+def build_prompt(
+    extra_details: str,
+    story_text: str,
+    age_appropriateness: str,
+    global_style: str,
+    character_ref: str,
+    lighting: str,
+    palette: str,
+    framing: str = "",
+) -> str:
+    """Build a structured prompt with explicit sections for all style controls, main text, and extra details."""
+    extra = (extra_details or "").strip()
+    story = (story_text or "").strip()
+    age = (age_appropriateness or "").strip()
+    style = (global_style or "").strip()
+    char = (character_ref or "").strip()
+    light = (lighting or "").strip()
+    pal = (palette or "").strip()
+    frame = (framing or "").strip()
+
+    sections = []
+    sections.append(f"SCENE TO ILLUSTRATE: {story}" if story else "SCENE TO ILLUSTRATE: (illustrate the story moment)")
+    if extra:
+        sections.append(f"EXTRA VISUAL DETAILS: {extra}")
+    if age:
+        sections.append(f"AGE APPROPRIATENESS: {age}")
+    if style:
+        sections.append(f"GLOBAL STYLE: {style}")
+    if char:
+        sections.append(f"CHARACTER REFERENCE (use exactly, keep consistent): {char}")
+    if light:
+        sections.append(f"LIGHTING: {light}")
+    if pal:
+        sections.append(f"COLOR PALETTE: {pal}")
+    if frame:
+        sections.append(f"FRAMING: {frame}")
+
+    body = ". ".join(sections)
+    return f"{SYSTEM_INSTRUCTIONS}{body}"
+
+
+def get_reference_images(
+    ref_file=None,
+    selected_page_index: Optional[int] = None,
+    pages=None,
+    ref_image_url: Optional[str] = None,
+) -> List[bytes]:
+    """Collect reference images: uploaded file, selected in-session page, or published/uploaded page URL."""
+    refs: List[bytes] = []
+    if ref_file is not None:
+        if hasattr(ref_file, "seek"):
+            ref_file.seek(0)
+        data = ref_file.read()
+        if data:
+            refs.append(data)
+    if selected_page_index is not None and pages and 0 <= selected_page_index < len(pages):
+        p = pages[selected_page_index]
+        if p.get("image"):
+            refs.append(p["image"])
+    if ref_image_url and ref_image_url.strip():
+        try:
+            r = requests.get(ref_image_url, timeout=10)
+            if r.ok and r.content:
+                refs.append(r.content)
+        except Exception:
+            pass
+    return refs
+
+
+def get_gemini():
+    """Get Google Gemini client (cached in session state)."""
+    if st.session_state.gemini_client is None:
+        api_key = get_secret("GEMINI_API_KEY")
+        if not api_key:
+            st.error("Set GEMINI_API_KEY in .env for Nano Banana Pro.")
+            return None
+        try:
+            from google import genai
+            st.session_state.gemini_client = genai.Client(api_key=api_key)
+        except ImportError:
+            st.error("Install google-genai: pip install google-genai")
+            return None
+    return st.session_state.gemini_client
+
+
+def _prepare_reference_images(reference_images: Optional[List[bytes]]) -> List[Image.Image]:
+    """Validate and normalize reference images to RGB PIL Images. Skips any that fail."""
+    prepared = []
+    if not reference_images:
+        return prepared
+    for img_bytes in reference_images[:5]:
+        try:
+            img = Image.open(BytesIO(img_bytes))
+            if img.mode != "RGB":
+                img = img.convert("RGB")
+            prepared.append(img)
+        except Exception:
+            pass
+    return prepared
+
+
+def _generate_image_with_client(client, prompt: str, reference_images: Optional[List[bytes]] = None) -> Tuple[Optional[bytes], Optional[str]]:
+    """Generate image using an existing Gemini client. Returns (image_bytes, error_message)."""
+    try:
+        from google.genai import types
+        ref_imgs = _prepare_reference_images(reference_images)
+        contents: list = [prompt] + ref_imgs
+        response = client.models.generate_content(
+            model="gemini-3-pro-image-preview",
+            contents=contents,
+            config=types.GenerateContentConfig(
+                response_modalities=["TEXT", "IMAGE"],
+                image_config=types.ImageConfig(aspect_ratio="1:1"),
+            ),
+        )
+        if not response.candidates:
+            reason = "No response candidates"
+            if hasattr(response, "prompt_feedback") and response.prompt_feedback:
+                pf = response.prompt_feedback
+                if getattr(pf, "block_reason", None):
+                    reason = f"Blocked: {pf.block_reason}"
+                if getattr(pf, "block_reason_message", None):
+                    reason = f"{reason} — {pf.block_reason_message}"
+            return (None, reason)
+        candidate = response.candidates[0]
+        finish_reason = getattr(candidate, "finish_reason", None)
+        if finish_reason is not None:
+            fr = getattr(finish_reason, "name", str(finish_reason)).upper()
+            if fr not in ("STOP", "END_TURN", "1", ""):
+                return (None, f"Response finish reason: {finish_reason}")
+        parts = candidate.content.parts
+        for part in parts:
+            if hasattr(part, "inline_data") and part.inline_data is not None:
+                data = getattr(part.inline_data, "data", None)
+                if data is not None:
+                    if isinstance(data, bytes):
+                        return (data, None)
+                    try:
+                        return (base64.b64decode(data), None)
+                    except Exception:
+                        return (data if isinstance(data, bytes) else bytes(data), None)
+            img = getattr(part, "as_image", lambda: None)()
+            if img is not None:
+                buf = BytesIO()
+                try:
+                    img.save(buf, "PNG")
+                except TypeError:
+                    img.save(buf)
+                return (buf.getvalue(), None)
+        return (None, "No image in response")
+    except Exception as e:
+        return (None, str(e))
+
+
+_GEMINI_MAX_RETRIES = 2
+
+
+def generate_image_gemini(prompt: str, reference_images: Optional[List[bytes]] = None) -> Optional[bytes]:
+    """Generate image via Nano Banana Pro (Gemini 3 Pro Image). Retries on transient errors."""
+    client = get_gemini()
+    if not client:
+        return None
+    last_error = None
+    for attempt in range(_GEMINI_MAX_RETRIES):
+        result, error = _generate_image_with_client(client, prompt, reference_images)
+        if result is not None:
+            return result
+        last_error = error or "Unknown error"
+        if attempt < _GEMINI_MAX_RETRIES - 1:
+            if any(code in last_error for code in ("400", "500", "503", "UNAVAILABLE")):
+                time.sleep(2)
+                continue
+            break
+        break
+    ref_count = len(reference_images) if reference_images else 0
+    diag = f"Prompt length: {len(prompt)} chars, reference images: {ref_count}"
+    st.error(f"Nano Banana Pro generation failed: {last_error}")
+    st.caption(f"Debug: {diag}")
+    return None
+
+
+def _build_batch_request_parts(prompt: str, ref_images: Optional[List[bytes]] = None) -> list:
+    """Build contents parts for a Batch API request: text + optional base64 ref images."""
+    parts = [{"text": prompt}]
+    if ref_images:
+        for img_bytes in ref_images[:5]:
+            b64 = base64.b64encode(img_bytes).decode("utf-8")
+            parts.append({"inline_data": {"mime_type": "image/png", "data": b64}})
+    return parts
+
+
+def _extract_image_from_batch_response(response) -> Optional[bytes]:
+    """Extract image bytes from a batch response part. Returns None if no image."""
+    if not response or not hasattr(response, "candidates"):
+        return None
+    candidates = getattr(response, "candidates", []) or []
+    if not candidates:
+        return None
+    content = getattr(candidates[0], "content", None)
+    if not content or not hasattr(content, "parts"):
+        return None
+    for part in content.parts or []:
+        if hasattr(part, "inline_data") and part.inline_data:
+            data = getattr(part.inline_data, "data", None)
+            if data:
+                try:
+                    return base64.b64decode(data) if isinstance(data, str) else data
+                except Exception:
+                    pass
+        img = getattr(part, "as_image", lambda: None)()
+        if img is not None:
+            buf = BytesIO()
+            try:
+                img.save(buf, "PNG")
+            except TypeError:
+                img.save(buf)
+            return buf.getvalue()
+    return None
 
 
 def fetch_image_for_display(url: str) -> Optional[bytes]:
@@ -57,19 +298,26 @@ def fetch_stories():
     try:
         r = (
             sb.table("stories")
-            .select("*")
+            .select('id, title, description, "Free", publish, created_at')
             .order("created_at", desc=True)
             .limit(1000)
             .execute()
         )
-        return r.data or []
+        data = r.data or []
+        # Normalize case-sensitive DB columns to lowercase for app code
+        for s in data:
+            if "Free" in s:
+                s["free"] = s.pop("Free")
+            if "publish" in s:
+                s["published"] = s.pop("publish")
+        return data
     except Exception as e:
         st.error(f"Failed to fetch stories: {e}")
         return []
 
 
 # Non-linked columns on stories table that can be edited in CRUD (excludes id, created_at, updated_at, etc.)
-STORY_EDITABLE_COLUMNS = ["title", "description"]
+STORY_EDITABLE_COLUMNS = ["title", "description", "free", "published"]
 
 # Style columns (Image Style Controls) - persisted per (story, grade) in story_grade_styles
 STORY_STYLE_COLUMNS = [
@@ -79,6 +327,7 @@ STORY_STYLE_COLUMNS = [
     "color_palette",
     "lighting",
     "framing",
+    "reference_page_index",
 ]
 
 
@@ -105,7 +354,11 @@ def upsert_story_grade_style(supabase, story_id: int, reading_level: str, data: 
     try:
         row = {"story_id": story_id, "reading_level": reading_level}
         for k in STORY_STYLE_COLUMNS:
-            if k in data:
+            if k not in data:
+                continue
+            if k == "reference_page_index":
+                row[k] = data[k]  # int or None
+            else:
                 row[k] = data[k] if data[k] is not None else ""
         supabase.table("story_grade_styles").upsert(row, on_conflict="story_id,reading_level").execute()
         return True
@@ -115,11 +368,20 @@ def upsert_story_grade_style(supabase, story_id: int, reading_level: str, data: 
 
 
 def insert_story(supabase, data: dict):
-    """Insert a row into stories. Only sends title and description (id is auto-generated)."""
+    """Insert a row into stories. Sends title, description, Free, publish (id is auto-generated)."""
     try:
-        row = {k: data.get(k) for k in STORY_EDITABLE_COLUMNS if k in data}
-        # Never send id - let the database sequence assign it
+        row = {}
+        for k in STORY_EDITABLE_COLUMNS:
+            if k in data:
+                row[k] = data[k]
+            elif k in ("free", "published"):
+                row[k] = False
         row.pop("id", None)
+        # Map to case-sensitive DB column names
+        if "free" in row:
+            row["Free"] = row.pop("free")
+        if "published" in row:
+            row["publish"] = row.pop("published")
         r = supabase.table("stories").insert(row).execute()
         return r.data[0] if r.data else None
     except Exception as e:
@@ -139,6 +401,11 @@ def update_story(supabase, story_id: int, data: dict):
         row = {k: data[k] for k in STORY_EDITABLE_COLUMNS if k in data}
         if not row:
             return True
+        # Map to case-sensitive DB column names
+        if "free" in row:
+            row["Free"] = row.pop("free")
+        if "published" in row:
+            row["publish"] = row.pop("published")
         supabase.table("stories").update(row).eq("id", story_id).execute()
         return True
     except Exception as e:
@@ -763,19 +1030,6 @@ def run_audio_generator_view():
 
     api_key = get_secret("ELEVENLABS_API_KEY")
 
-    VOICES_MALE = [
-        ("Hale", "nzFihrBIvB34imQBuxub", "Warm, friendly"),
-        ("Johnny Kid", "8JVbfL6oEdmuxKn5DK2C", "Serious, calm narrator"),
-        ("David", "FF7KdobWPaiR0vkcALHF", "Deep, engaging"),
-        ("Father Christmas", "1wg2wOjdEWKA7yQD8Kca", "Magical storyteller"),
-    ]
-    VOICES_FEMALE = [
-        ("Zara", "jqcCZkN6Knx8BJ5TBdYR", "Clear, natural"),
-        ("Amelia", "ZF6FPAbjXT4488VcRRnw", "Enthusiastic, expressive"),
-        ("Emma Taylor", "S9EGwlCtMF7VXtENq79v", "Gentle, thoughtful"),
-        ("Rachel", "21m00Tcm4TlvDq8ikWAM", "Professional, warm"),
-    ]
-
     if not api_key:
         st.warning("Set ELEVENLABS_API_KEY in .env or Streamlit secrets.")
         return
@@ -1286,9 +1540,9 @@ def run_audio_generator_view():
 
 
 def run_book_pages_view():
-    """Render Book Pages with data editor CRUD plus media actions."""
+    """Render Book Pages: page selector + focus panel with edit text, regenerate image/audio, upload, delete."""
     st.title("Book Pages")
-    st.caption("View, search, filter, sort, and manage pages (text/index + image/audio actions).")
+    st.caption("View, search, filter, sort, and manage each page (edit text, regenerate or upload image/audio, delete).")
     sb = get_supabase()
     if not sb:
         return
@@ -1384,83 +1638,69 @@ def run_book_pages_view():
         st.info("No pages match current search/filter.")
         return
 
-    editor_df = pd.DataFrame(
-        [
-            {
-                "id": r.get("id"),
-                "page_number": int(r.get("page_index", r.get(PAGE_NUMBER_COLUMN, 0)) or 0),
-                "page_text": r.get("_display_text", ""),
-            }
-            for r in filtered_rows
-        ]
-    )
-    edited_df = st.data_editor(
-        editor_df,
-        num_rows="fixed",
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "id": st.column_config.NumberColumn("ID", disabled=True),
-            "page_number": st.column_config.NumberColumn("Page", min_value=0, step=1),
-            "page_text": st.column_config.TextColumn("Page Text", width="large"),
-        },
-        key="bp_editor",
-    )
-
-    if st.button("💾 Save changes", key="bp_save_changes"):
-        originals = {int(r.get("id")): r for r in filtered_rows if r.get("id") is not None}
-        text_changes = 0
-        index_changes = 0
-        for _, row in edited_df.iterrows():
-            rid = row.get("id")
-            if pd.isna(rid):
-                continue
-            rid = int(rid)
-            original = originals.get(rid)
-            if not original:
-                continue
-            old_text = original.get("_display_text", "")
-            old_index = int(original.get("page_index", original.get(PAGE_NUMBER_COLUMN, 0)) or 0)
-            new_text = str(row.get("page_text", "") or "")
-            try:
-                new_index = int(row.get("page_number", 0) or 0)
-            except Exception:
-                new_index = old_index
-            changed_text = new_text != old_text
-            changed_index = new_index != old_index
-            if changed_text or changed_index:
-                ok = update_book_page(
-                    sb,
-                    rid,
-                    page_text=new_text if changed_text else None,
-                    page_index=new_index if changed_index else None,
-                )
-                if ok:
-                    if changed_text:
-                        text_changes += 1
-                    if changed_index:
-                        index_changes += 1
-        st.success(f"Saved {text_changes} text and {index_changes} page index edit(s).")
-        st.rerun()
-
-    # Actions panel (keeps image/audio replace + delete functionality)
-    st.divider()
-    st.subheader("Row actions")
-    action_rows = [r for r in filtered_rows if r.get("id") is not None]
+    # Page selector
     def _pn(r):
         return r.get("page_index", r.get(PAGE_NUMBER_COLUMN, 0))
-    action_options = [f"Page {_pn(r)} (id: {r.get('id')})" for r in action_rows]
-    action_map = {f"Page {_pn(r)} (id: {r.get('id')})": r for r in action_rows}
-    if action_options:
-        selected_label = st.selectbox("Select a page", options=action_options, key="bp_action_row")
-        selected_row = action_map.get(selected_label)
-    else:
-        selected_row = None
 
+    action_rows = [r for r in filtered_rows if r.get("id") is not None]
+    page_options = []
+    page_map = {}
+    for r in action_rows:
+        snippet = (r.get("_display_text", "") or "")[:50]
+        if len((r.get("_display_text") or "")) > 50:
+            snippet += "..."
+        label = f"Page {_pn(r)} — {snippet or '(no text)'}"
+        page_options.append(label)
+        page_map[label] = r
+
+    selected_label = st.selectbox("Select a page", options=page_options, key="bp_page_sel")
+    selected_row = page_map.get(selected_label) if selected_label else None
+
+    # Audio settings (for Regenerate audio)
+    with st.expander("Audio settings (for Regenerate)", expanded=False):
+        bp_voice_male = st.selectbox(
+            "Male voice",
+            options=range(len(VOICES_MALE)),
+            format_func=lambda i: f"{VOICES_MALE[i][0]} — {VOICES_MALE[i][2]}",
+            key="bp_voice_male",
+        )
+        bp_voice_female = st.selectbox(
+            "Female voice",
+            options=range(len(VOICES_FEMALE)),
+            format_func=lambda i: f"{VOICES_FEMALE[i][0]} — {VOICES_FEMALE[i][2]}",
+            key="bp_voice_female",
+        )
+        bp_speed = st.slider("Speed", min_value=0.7, max_value=1.2, value=1.0, step=0.05, key="bp_speed")
+
+    # Focus panel for selected page
     if selected_row:
-        a1, a2, a3 = st.columns([1, 1, 1])
-        with a1:
-            st.markdown("**Image**")
+        row_id = selected_row.get("id")
+        page_text = selected_row.get("_display_text", "")
+        page_idx = _pn(selected_row)
+
+        st.divider()
+        st.subheader(f"Page {page_idx}")
+
+        # Text edit
+        st.markdown("**Page text**")
+        new_text = st.text_area(
+            "Edit text",
+            value=page_text,
+            height=100,
+            key=f"bp_text_{row_id}",
+        )
+        if st.button("Save text", key=f"bp_save_text_{row_id}"):
+            current = st.session_state.get(f"bp_text_{row_id}", new_text)
+            if update_book_page(sb, row_id, page_text=(current or "").strip()):
+                st.success("Text saved.")
+                st.rerun()
+            else:
+                st.error("Failed to save text.")
+
+        # Image: thumbnail + Regenerate / Replace / Remove
+        st.markdown("**Image**")
+        img_col, img_actions = st.columns([1, 2])
+        with img_col:
             img_url = selected_row.get("image_url") or ""
             if img_url:
                 img_bytes = fetch_image_for_display(img_url)
@@ -1479,33 +1719,149 @@ def run_book_pages_view():
                         st.caption("(image)")
             else:
                 st.caption("No image")
-            if st.button("Replace image", key=f"bp_replace_img_{selected_row['id']}"):
+
+        with img_actions:
+            # Reference image for regeneration (same story+level pages with image_url)
+            published_with_images = []
+            for r in rows:
+                url = (r.get("image_url") or "").strip()
+                if url and r.get("id") != row_id:
+                    pi = r.get("page_index", r.get(PAGE_NUMBER_COLUMN, 0))
+                    published_with_images.append((pi, url))
+            published_with_images.sort(key=lambda x: x[0])
+            ref_page_options = ["None"] + [f"Page {pi}" for pi, _ in published_with_images]
+            ref_page_labels = {f"Page {pi}": url for pi, url in published_with_images}
+            grade_style = get_story_grade_style(sb, story_id, reading_level)
+            ref_default = "None"
+            if grade_style and grade_style.get("reference_page_index") is not None:
+                ref_label = f"Page {grade_style['reference_page_index']}"
+                if ref_label in ref_page_options:
+                    ref_default = ref_label
+            ref_idx = ref_page_options.index(ref_default) if ref_default in ref_page_options else 0
+            ref_selected = st.selectbox("Reference image (for Regenerate)", options=ref_page_options, index=ref_idx, key=f"bp_ref_{row_id}")
+            selected_ref_url = ref_page_labels.get(ref_selected) if ref_selected != "None" else None
+
+            correction = st.text_input("Correction (optional)", key=f"bp_corr_{row_id}", placeholder="e.g. Add a dragon in the background")
+            if st.button("Regenerate image", key=f"bp_regen_img_{row_id}"):
+                client = get_gemini()
+                if not client:
+                    st.error("Set GEMINI_API_KEY in .env.")
+                else:
+                    style = grade_style or {}
+                    ap = (style.get("age_appropriateness") or "").strip()
+                    sp = (style.get("global_style") or "").strip()
+                    cr = (style.get("character_ref") or "").strip()
+                    li = (style.get("lighting") or "").strip()
+                    cp = (style.get("color_palette") or "").strip()
+                    fr = (style.get("framing") or "").strip()
+                    text_for_prompt = (st.session_state.get(f"bp_text_{row_id}", new_text) or "").strip() or page_text
+                    prompt = build_prompt(
+                        (correction or "").strip(),
+                        text_for_prompt,
+                        ap, sp, cr, li, cp, fr,
+                    )
+                    refs = get_reference_images(ref_image_url=selected_ref_url)
+                    with st.spinner("Generating image..."):
+                        img = generate_image_gemini(prompt, refs if refs else None)
+                    if img:
+                        opt = optimize_image_for_mobile(img)
+                        url_new = upload_image_to_storage(sb, story_id, reading_level, page_idx, opt)
+                        if url_new and update_book_page(sb, row_id, image_url=url_new):
+                            st.success("Image regenerated and saved.")
+                            st.rerun()
+                        else:
+                            st.error("Upload or save failed.")
+                    else:
+                        st.error("Image generation failed.")
+
+            if st.button("Replace image", key=f"bp_replace_img_{row_id}"):
                 st.session_state.bp_editing_image = selected_row
                 st.rerun()
+            if img_url and st.button("Remove image", key=f"bp_remove_img_{row_id}", type="secondary"):
+                if update_book_page(sb, row_id, image_url=""):
+                    st.success("Image removed.")
+                    st.rerun()
+
+        # Male / Female audio
+        st.markdown("**Male audio**")
+        male_url = selected_row.get("audio_male_url")
+        if male_url:
+            st.audio(male_url, format="audio/mpeg")
+        else:
+            st.caption("—")
+        a1, a2 = st.columns(2)
+        with a1:
+            if st.button("Regenerate male", key=f"bp_regen_m_{row_id}"):
+                api_key = get_secret("ELEVENLABS_API_KEY")
+                if not api_key:
+                    st.error("Set ELEVENLABS_API_KEY in .env for Regenerate audio.")
+                else:
+                    text_for_audio = (st.session_state.get(f"bp_text_{row_id}", new_text) or "").strip() or page_text
+                    if not text_for_audio:
+                        st.warning("Page text is empty.")
+                    else:
+                        voice_id = VOICES_MALE[bp_voice_male][1]
+                        with st.spinner("Generating male audio..."):
+                            audio_bytes, timing = generate_elevenlabs_audio(
+                                api_key, voice_id, text_for_audio, language_code,
+                                stability=0.5, similarity_boost=0.75, speed=bp_speed,
+                            )
+                        if audio_bytes:
+                            url_audio = upload_audio_to_stories_path(sb, story_id, language_code, reading_level, "male", page_idx, audio_bytes)
+                            if url_audio and update_book_page(sb, row_id, audio_male_url=url_audio, timing_male_json=timing):
+                                st.success("Male audio regenerated and saved.")
+                                st.rerun()
+                            else:
+                                st.error("Upload or save failed.")
+                        else:
+                            st.error("Audio generation failed.")
         with a2:
-            st.markdown("**Male audio**")
-            male_url = selected_row.get("audio_male_url")
-            if male_url:
-                st.audio(male_url, format="audio/mpeg")
-            else:
-                st.caption("—")
-            if st.button("Upload male audio", key=f"bp_upload_m_{selected_row['id']}"):
+            if st.button("Upload male audio", key=f"bp_upload_m_{row_id}"):
                 st.session_state.bp_editing_audio = (selected_row, "male")
                 st.rerun()
-        with a3:
-            st.markdown("**Female audio**")
-            female_url = selected_row.get("audio_female_url")
-            if female_url:
-                st.audio(female_url, format="audio/mpeg")
-            else:
-                st.caption("—")
-            if st.button("Upload female audio", key=f"bp_upload_f_{selected_row['id']}"):
+
+        st.markdown("**Female audio**")
+        female_url = selected_row.get("audio_female_url")
+        if female_url:
+            st.audio(female_url, format="audio/mpeg")
+        else:
+            st.caption("—")
+        f1, f2 = st.columns(2)
+        with f1:
+            if st.button("Regenerate female", key=f"bp_regen_f_{row_id}"):
+                api_key = get_secret("ELEVENLABS_API_KEY")
+                if not api_key:
+                    st.error("Set ELEVENLABS_API_KEY in .env for Regenerate audio.")
+                else:
+                    text_for_audio = (st.session_state.get(f"bp_text_{row_id}", new_text) or "").strip() or page_text
+                    if not text_for_audio:
+                        st.warning("Page text is empty.")
+                    else:
+                        voice_id = VOICES_FEMALE[bp_voice_female][1]
+                        with st.spinner("Generating female audio..."):
+                            audio_bytes, timing = generate_elevenlabs_audio(
+                                api_key, voice_id, text_for_audio, language_code,
+                                stability=0.5, similarity_boost=0.75, speed=bp_speed,
+                            )
+                        if audio_bytes:
+                            url_audio = upload_audio_to_stories_path(sb, story_id, language_code, reading_level, "female", page_idx, audio_bytes)
+                            if url_audio and update_book_page(sb, row_id, audio_female_url=url_audio, timing_female_json=timing):
+                                st.success("Female audio regenerated and saved.")
+                                st.rerun()
+                            else:
+                                st.error("Upload or save failed.")
+                        else:
+                            st.error("Audio generation failed.")
+        with f2:
+            if st.button("Upload female audio", key=f"bp_upload_f_{row_id}"):
                 st.session_state.bp_editing_audio = (selected_row, "female")
                 st.rerun()
 
-        if st.button("🗑️ Delete selected row", key=f"bp_del_{selected_row['id']}", type="secondary"):
-            st.session_state.bp_pending_delete = [selected_row["id"]]
-            st.rerun()
+        # Delete
+        with st.expander("Danger zone", expanded=False):
+            if st.button("Delete this page", key=f"bp_del_{row_id}", type="secondary"):
+                st.session_state.bp_pending_delete = [row_id]
+                st.rerun()
 
     # Replace image modal
     if st.session_state.get("bp_editing_image"):
@@ -1533,7 +1889,4 @@ def run_book_pages_view():
                 del st.session_state.bp_pending_delete
                 st.rerun()
 
-    st.caption(
-        "Use search/filter/sort above, edit Page or Page Text in the table, then click Save changes. "
-        "Use Row actions to replace image/audio or delete a row."
-    )
+    st.caption("Use the page selector above. Edit text and click Save text. Regenerate or upload image/audio, or delete in Danger zone.")

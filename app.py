@@ -7,7 +7,7 @@ Review/approve/regenerate, then export to Supabase Storage + story_content_flat 
 import base64
 import os
 from io import BytesIO
-from typing import List, Optional
+from typing import List, Optional, Tuple
 
 from PIL import Image
 
@@ -16,19 +16,25 @@ from dotenv import load_dotenv
 
 from auth import get_secret, is_authenticated, logout, run_login_page
 from lib import (
-    fetch_batch_jobs_for_story,
+    _build_batch_request_parts,
+    _extract_image_from_batch_response,
+    build_prompt,
     fetch_batch_jobs_for_version,
-    fetch_image_for_display,
     fetch_book_pages,
     fetch_pages_missing_images,
     fetch_stories,
+    generate_image_gemini,
+    get_gemini,
+    get_reference_images,
     get_supabase,
     get_story_grade_style,
     insert_batch_job,
+    optimize_image_for_mobile,
     run_audio_generator_view,
     run_book_pages_view,
     update_batch_job_status,
     update_book_page,
+    upload_image_to_storage,
     upsert_story_grade_style,
 )
 from stories_page import run_stories_view
@@ -83,6 +89,40 @@ GRADE_STYLE_DEFAULTS = {
 }
 
 
+# Cache TTL for Image Processor Supabase fetches (seconds)
+_IP_CACHE_TTL = 60
+
+
+@st.cache_data(ttl=_IP_CACHE_TTL, show_spinner=False)
+def _cached_fetch_stories(_cache_version: int):
+    sb = get_supabase()
+    return fetch_stories() if sb else []
+
+
+@st.cache_data(ttl=_IP_CACHE_TTL, show_spinner=False)
+def _cached_fetch_pages_missing_images(story_id: int, language_code: str, reading_level: str, _cache_version: int):
+    sb = get_supabase()
+    return fetch_pages_missing_images(sb, story_id, language_code, reading_level) if sb else []
+
+
+@st.cache_data(ttl=_IP_CACHE_TTL, show_spinner=False)
+def _cached_get_story_grade_style(story_id: int, reading_level: str, _cache_version: int):
+    sb = get_supabase()
+    return get_story_grade_style(sb, story_id, reading_level) if sb else None
+
+
+@st.cache_data(ttl=_IP_CACHE_TTL, show_spinner=False)
+def _cached_fetch_book_pages(story_id: int, reading_level: str, language_code: str, _cache_version: int):
+    sb = get_supabase()
+    return fetch_book_pages(sb, story_id, reading_level, language_code) if sb else []
+
+
+@st.cache_data(ttl=_IP_CACHE_TTL, show_spinner=False)
+def _cached_fetch_batch_jobs_for_version(story_id: int, reading_level: str, _cache_version: int):
+    sb = get_supabase()
+    return fetch_batch_jobs_for_version(sb, story_id, reading_level) if sb else []
+
+
 def init_session_state():
     """Initialize session state keys."""
     defaults = {
@@ -95,6 +135,7 @@ def init_session_state():
         "openai_client": None,
         "gemini_client": None,
         "ip_pending_images": {},  # row_id -> optimized image bytes (awaiting approve)
+        "ip_cache_version": 0,  # bumped on Approve so cache invalidates and data refreshes
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -139,54 +180,6 @@ def build_style_string(
     return ", ".join(parts)
 
 
-SYSTEM_INSTRUCTIONS = (
-    "You are a consistent storybook illustrator. CRITICAL: The main character must have the EXACT SAME face, hair, beard, and clothing in every image. "
-    "Use the provided character description as a fixed design—do not vary it. No creative reinterpretation of the character. "
-    "Quality: Standard. Aspect Ratio: 1024x1024. Never include text, words, or letters in the image. "
-)
-
-
-def build_prompt(
-    extra_details: str,
-    story_text: str,
-    age_appropriateness: str,
-    global_style: str,
-    character_ref: str,
-    lighting: str,
-    palette: str,
-    framing: str = "",
-) -> str:
-    """Build a structured prompt with explicit sections for all style controls, main text, and extra details."""
-    extra = (extra_details or "").strip()
-    story = (story_text or "").strip()
-    age = (age_appropriateness or "").strip()
-    style = (global_style or "").strip()
-    char = (character_ref or "").strip()
-    light = (lighting or "").strip()
-    pal = (palette or "").strip()
-    frame = (framing or "").strip()
-
-    sections = []
-    sections.append(f"SCENE TO ILLUSTRATE: {story}" if story else "SCENE TO ILLUSTRATE: (illustrate the story moment)")
-    if extra:
-        sections.append(f"EXTRA VISUAL DETAILS: {extra}")
-    if age:
-        sections.append(f"AGE APPROPRIATENESS: {age}")
-    if style:
-        sections.append(f"GLOBAL STYLE: {style}")
-    if char:
-        sections.append(f"CHARACTER REFERENCE (use exactly, keep consistent): {char}")
-    if light:
-        sections.append(f"LIGHTING: {light}")
-    if pal:
-        sections.append(f"COLOR PALETTE: {pal}")
-    if frame:
-        sections.append(f"FRAMING: {frame}")
-
-    body = ". ".join(sections)
-    return f"{SYSTEM_INSTRUCTIONS}{body}"
-
-
 def generate_extra_details(
     client,
     story_text: str,
@@ -220,172 +213,6 @@ def generate_extra_details(
     except Exception as e:
         st.error(f"Failed to generate extra details: {e}")
         return None
-
-
-def get_reference_images(
-    ref_file=None,
-    selected_page_index: Optional[int] = None,
-    pages=None,
-    ref_image_url: Optional[str] = None,
-) -> List[bytes]:
-    """Collect reference images: uploaded file, selected in-session page, or published/uploaded page URL."""
-    refs: List[bytes] = []
-    if ref_file is not None:
-        if hasattr(ref_file, "seek"):
-            ref_file.seek(0)
-        data = ref_file.read()
-        if data:
-            refs.append(data)
-    if selected_page_index is not None and pages and 0 <= selected_page_index < len(pages):
-        p = pages[selected_page_index]
-        if p.get("image"):
-            refs.append(p["image"])
-    if ref_image_url and ref_image_url.strip():
-        try:
-            import requests
-            r = requests.get(ref_image_url, timeout=10)
-            if r.ok and r.content:
-                refs.append(r.content)
-        except Exception:
-            pass
-    return refs
-
-
-def get_gemini():
-    """Get Google Gemini client (cached in session state)."""
-    if st.session_state.gemini_client is None:
-        api_key = get_secret("GEMINI_API_KEY")
-        if not api_key:
-            st.error("Set GEMINI_API_KEY in .env for Nano Banana Pro.")
-            return None
-        try:
-            from google import genai
-            st.session_state.gemini_client = genai.Client(api_key=api_key)
-        except ImportError:
-            st.error("Install google-genai: pip install google-genai")
-            return None
-    return st.session_state.gemini_client
-
-
-def _generate_image_with_client(client, prompt: str, reference_images: Optional[List[bytes]] = None) -> Optional[bytes]:
-    """Generate image using an existing Gemini client (for background worker)."""
-    try:
-        from google.genai import types
-        contents = [prompt]
-        if reference_images:
-            for img_bytes in reference_images[:5]:
-                contents.append(Image.open(BytesIO(img_bytes)))
-        response = client.models.generate_content(
-            model="gemini-3-pro-image-preview",
-            contents=contents,
-            config=types.GenerateContentConfig(
-                response_modalities=["TEXT", "IMAGE"],
-                image_config=types.ImageConfig(aspect_ratio="1:1"),
-            ),
-        )
-        parts = response.candidates[0].content.parts
-        for part in parts:
-            if hasattr(part, "inline_data") and part.inline_data is not None:
-                data = getattr(part.inline_data, "data", None)
-                if data is not None:
-                    if isinstance(data, bytes):
-                        return data
-                    try:
-                        return base64.b64decode(data)
-                    except Exception:
-                        return data if isinstance(data, bytes) else bytes(data)
-            img = getattr(part, "as_image", lambda: None)()
-            if img is not None:
-                buf = BytesIO()
-                try:
-                    img.save(buf, "PNG")
-                except TypeError:
-                    img.save(buf)
-                return buf.getvalue()
-        return None
-    except Exception as e:
-        return None  # Worker thread; don't use st.error here
-
-
-def generate_image_gemini(prompt: str, reference_images: Optional[List[bytes]] = None) -> Optional[bytes]:
-    """Generate image via Nano Banana Pro (Gemini 3 Pro Image)."""
-    client = get_gemini()
-    if not client:
-        return None
-    result = _generate_image_with_client(client, prompt, reference_images)
-    if result is None:
-        st.error("Nano Banana Pro generation failed.")
-    return result
-
-
-MAX_IMAGE_SIZE = 800
-TARGET_BYTES = 100_000  # ~100KB for mobile
-
-
-def optimize_image_for_mobile(image_bytes: bytes) -> bytes:
-    """Resize to max 800x800 and convert to WebP, targeting ~100KB for mobile."""
-    img = Image.open(BytesIO(image_bytes)).convert("RGB")
-    w, h = img.size
-    if w > MAX_IMAGE_SIZE or h > MAX_IMAGE_SIZE:
-        ratio = min(MAX_IMAGE_SIZE / w, MAX_IMAGE_SIZE / h)
-        new_size = (int(w * ratio), int(h * ratio))
-        img = img.resize(new_size, Image.Resampling.LANCZOS)
-    buf = BytesIO()
-    for quality in [85, 80, 75, 70, 65, 60]:
-        buf.seek(0)
-        buf.truncate(0)
-        img.save(buf, "WEBP", quality=quality)
-        if buf.tell() <= TARGET_BYTES:
-            break
-    buf.seek(0)
-    return buf.read()
-
-
-def upload_to_storage(supabase, story_id: int, reading_level: str, page_index: int, image_bytes: bytes) -> Optional[str]:
-    """Upload image to R2. Returns public URL or None."""
-    from storage_r2 import upload_image
-
-    path = f"{story_id}/{reading_level}/page_{page_index}.webp"
-    return upload_image(path, image_bytes)
-
-
-def _build_batch_request_parts(prompt: str, ref_images: Optional[List[bytes]] = None) -> list:
-    """Build contents parts for a Batch API request: text + optional base64 ref images."""
-    parts = [{"text": prompt}]
-    if ref_images:
-        for img_bytes in ref_images[:5]:
-            b64 = base64.b64encode(img_bytes).decode("utf-8")
-            parts.append({"inline_data": {"mime_type": "image/png", "data": b64}})
-    return parts
-
-
-def _extract_image_from_batch_response(response) -> Optional[bytes]:
-    """Extract image bytes from a batch response part. Returns None if no image."""
-    if not response or not hasattr(response, "candidates"):
-        return None
-    candidates = getattr(response, "candidates", []) or []
-    if not candidates:
-        return None
-    content = getattr(candidates[0], "content", None)
-    if not content or not hasattr(content, "parts"):
-        return None
-    for part in content.parts or []:
-        if hasattr(part, "inline_data") and part.inline_data:
-            data = getattr(part.inline_data, "data", None)
-            if data:
-                try:
-                    return base64.b64decode(data) if isinstance(data, str) else data
-                except Exception:
-                    pass
-        img = getattr(part, "as_image", lambda: None)()
-        if img is not None:
-            buf = BytesIO()
-            try:
-                img.save(buf, "PNG")
-            except TypeError:
-                img.save(buf)
-            return buf.getvalue()
-    return None
 
 
 def main():
@@ -431,7 +258,8 @@ def main():
     if not sb:
         return
 
-    stories = fetch_stories()
+    _v = st.session_state.get("ip_cache_version", 0)
+    stories = _cached_fetch_stories(_v)
     if not stories:
         st.warning("No stories found. Create stories in Supabase first.")
         return
@@ -443,48 +271,20 @@ def main():
     story_label = st.selectbox("Story", options=list(story_options.keys()), key="ip_story")
     story_id = story_options.get(story_label) if story_label else None
 
-    ip_mode = st.radio(
-        "Mode",
-        options=["Single level", "All levels"],
-        key="ip_mode",
-        horizontal=True,
-        help="Single level: one grade at a time. All levels: set style per grade, then batch all missing images for this story.",
-    )
-    all_levels_mode = ip_mode == "All levels"
+    reading_level = st.selectbox("Reading level", options=READING_LEVELS, key="ip_reading_level", format_func=lambda x: x.replace("_", " ").title())
 
     if not story_id:
         st.info("Select a story to continue.")
         return
 
-    if all_levels_mode:
-        # Fetch missing pages for every level
-        levels_missing = {
-            level: fetch_pages_missing_images(sb, story_id, language_code, level)
-            for level in READING_LEVELS
-        }
-        total_missing = sum(len(p) for p in levels_missing.values())
-        if total_missing == 0:
-            st.success("No pages missing images for this story across any level.")
-            st.caption("Add page text in Story Text first, or pick another story.")
-            return
-        # Summary: Grade 1: 12 missing · Grade 2: 12 missing · … · Total: 58
-        parts = [f"**{level}**: {len(levels_missing[level])} missing" for level in READING_LEVELS]
-        st.success(" · ".join(parts) + f" → **Total: {total_missing} pages**")
-        # Current level for style/review: user picks via tabs/selector; default first level with missing
-        if "ip_all_level" not in st.session_state or st.session_state["ip_all_level"] not in READING_LEVELS:
-            st.session_state["ip_all_level"] = next(
-                (lev for lev in READING_LEVELS if levels_missing[lev]), READING_LEVELS[0]
-            )
-        reading_level = st.session_state["ip_all_level"]
-        pages_missing = levels_missing.get(reading_level, [])
+    # Pop just_approved early so we treat just-approved rows as no longer missing (avoids stale refetch showing them still missing)
+    just_approved = st.session_state.pop("ip_just_approved", None) or {}
+    pages_missing = _cached_fetch_pages_missing_images(story_id, language_code, reading_level, _v)
+    pages_missing_display = [r for r in pages_missing if r.get("id") not in just_approved]
+    if pages_missing_display:
+        st.success(f"**{len(pages_missing_display)}** pages missing images.")
     else:
-        reading_level = st.selectbox("Reading level", options=READING_LEVELS, key="ip_reading_level")
-        pages_missing = fetch_pages_missing_images(sb, story_id, language_code, reading_level)
-        if not pages_missing:
-            st.success("No pages missing images for this story + reading level.")
-            st.caption("Add page text in Story Text first, or pick another story/level.")
-            return
-        st.success(f"**{len(pages_missing)}** pages missing images.")
+        st.info("No pages missing images for this story + reading level. You can still set or save style below, or add page text in Story Text and return here.")
 
     # Load style defaults for current (story_id, reading_level)
     story = next((s for s in stories if s.get("id") == story_id), None)
@@ -494,101 +294,89 @@ def main():
             for key in ["character_ref", "global_style", "age_appropriateness", "color_palette", "lighting", "framing"]:
                 if story.get(key) not in (None, ""):
                     defaults[key] = story[key]
-        grade_style = get_story_grade_style(sb, story_id, reading_level)
+        grade_style = _cached_get_story_grade_style(story_id, reading_level, _v)
         if grade_style:
             for key in ["age_appropriateness", "global_style", "character_ref", "color_palette", "lighting", "framing"]:
                 if grade_style.get(key) not in (None, ""):
                     defaults[key] = grade_style[key]
-        # In all_levels_mode we don't persist to generic session_state; we use value= from defaults in the form
-        if not all_levels_mode:
-            for k, v in defaults.items():
-                if k == "global_style":
-                    if "style_prompt" not in st.session_state or not (st.session_state.get("style_prompt") or "").strip():
-                        st.session_state["style_prompt"] = v
-                elif k not in st.session_state or not (st.session_state.get(k) or "").strip():
-                    st.session_state[k] = v
+        # When user changes story or reading level, reload style controls from that level's defaults/saved style.
+        loaded_for = st.session_state.get("ip_style_loaded_for")
+        current_for = f"{story_id}_{reading_level}"
+        if loaded_for != current_for:
+            st.session_state["ip_style_loaded_for"] = current_for
+            st.session_state["age_appropriateness"] = defaults.get("age_appropriateness", "")
+            st.session_state["style_prompt"] = defaults.get("global_style", "")
+            st.session_state["character_ref"] = defaults.get("character_ref", "")
+            st.session_state["color_palette"] = defaults.get("color_palette", "")
+            st.session_state["lighting"] = defaults.get("lighting", "")
+            st.session_state["framing"] = defaults.get("framing", "")
+        else:
+            # Same story+level: fill any missing keys so fields aren't empty on first load.
+            if "age_appropriateness" not in st.session_state or st.session_state.get("age_appropriateness") == "":
+                st.session_state["age_appropriateness"] = defaults.get("age_appropriateness", "")
+            if "style_prompt" not in st.session_state or st.session_state.get("style_prompt") == "":
+                st.session_state["style_prompt"] = defaults.get("global_style", "")
+            if "character_ref" not in st.session_state or st.session_state.get("character_ref") == "":
+                st.session_state["character_ref"] = defaults.get("character_ref", "")
+            if "color_palette" not in st.session_state or st.session_state.get("color_palette") == "":
+                st.session_state["color_palette"] = defaults.get("color_palette", "")
+            if "lighting" not in st.session_state or st.session_state.get("lighting") == "":
+                st.session_state["lighting"] = defaults.get("lighting", "")
+            if "framing" not in st.session_state or st.session_state.get("framing") == "":
+                st.session_state["framing"] = defaults.get("framing", "")
 
     # --- Image style controls ---
     st.header("2. Image style controls")
-    if all_levels_mode:
-        st.caption("Set style separately for each level. Select a level, edit, then Save. Batch submit uses saved styles.")
-        level_label = st.selectbox(
-            "Editing style for",
-            options=READING_LEVELS,
-            key="ip_all_level",
-            format_func=lambda x: x.replace("_", " ").title(),
-        )
-        reading_level = level_label  # use selected level for form and save
-        # Re-load defaults for the selected level (for value= below)
-        defaults = dict(GRADE_STYLE_DEFAULTS.get(reading_level, GRADE_STYLE_DEFAULTS["grade_1"]))
-        if story:
-            for key in ["character_ref", "global_style", "age_appropriateness", "color_palette", "lighting", "framing"]:
-                if story.get(key) not in (None, ""):
-                    defaults[key] = story[key]
-        grade_style = get_story_grade_style(sb, story_id, reading_level)
-        if grade_style:
-            for key in ["age_appropriateness", "global_style", "character_ref", "color_palette", "lighting", "framing"]:
-                if grade_style.get(key) not in (None, ""):
-                    defaults[key] = grade_style[key]
-        age_appropriateness_val = defaults.get("age_appropriateness", "")
-        style_prompt_val = defaults.get("global_style", "")
-        character_ref_val = defaults.get("character_ref", "")
-        color_palette_val = defaults.get("color_palette", "")
-        lighting_val = defaults.get("lighting", "")
-        framing_val = defaults.get("framing", "")
-        # Force session_state for this level so widgets show the loaded values when user switches grade
-        # (On Cloud, widget keys persist and value= is ignored once the key exists; without this, changing level doesn't update the form.)
-        if st.session_state.get("ip_style_loaded_level") != reading_level:
-            st.session_state["ip_style_loaded_level"] = reading_level
-            st.session_state[f"ip_age_{reading_level}"] = age_appropriateness_val
-            st.session_state[f"ip_style_{reading_level}"] = style_prompt_val
-            st.session_state[f"ip_char_{reading_level}"] = character_ref_val
-            st.session_state[f"ip_color_{reading_level}"] = color_palette_val
-            st.session_state[f"ip_light_{reading_level}"] = lighting_val
-            st.session_state[f"ip_frame_{reading_level}"] = framing_val
-    else:
-        age_appropriateness_val = st.session_state.get("age_appropriateness", "")
-        style_prompt_val = st.session_state.get("style_prompt", "")
-        character_ref_val = st.session_state.get("character_ref", "")
-        color_palette_val = st.session_state.get("color_palette", "")
-        lighting_val = st.session_state.get("lighting", "")
-        framing_val = st.session_state.get("framing", "")
-
     with st.expander("Style controls", expanded=True):
-        age_appropriateness = st.text_input(
-            "Age appropriateness",
-            value=age_appropriateness_val,
-            key="age_appropriateness" if not all_levels_mode else f"ip_age_{reading_level}",
-        )
-        style_prompt = st.text_area(
-            "Global style prompt",
-            value=style_prompt_val,
-            key="style_prompt" if not all_levels_mode else f"ip_style_{reading_level}",
-        )
-        character_ref = st.text_input(
-            "Character reference",
-            value=character_ref_val,
-            key="character_ref" if not all_levels_mode else f"ip_char_{reading_level}",
-        )
-        color_palette = st.text_input("Color palette", value=color_palette_val, key="color_palette" if not all_levels_mode else f"ip_color_{reading_level}")
-        lighting = st.text_input("Lighting", value=lighting_val, key="lighting" if not all_levels_mode else f"ip_light_{reading_level}")
-        framing = st.text_input("Framing", value=framing_val, key="framing" if not all_levels_mode else f"ip_frame_{reading_level}")
+        age_appropriateness = st.text_input("Age appropriateness", key="age_appropriateness")
+        style_prompt = st.text_area("Global style prompt", key="style_prompt")
+        character_ref = st.text_input("Character reference", key="character_ref")
+        color_palette = st.text_input("Color palette", key="color_palette")
+        lighting = st.text_input("Lighting", key="lighting")
+        framing = st.text_input("Framing", key="framing")
         ref_file = st.file_uploader(
             "Reference image for character consistency (optional)",
             type=["png", "jpg", "jpeg"],
             key="ref_image",
         )
-        all_pages = fetch_book_pages(sb, story_id, reading_level, language_code)
+        all_pages = _cached_fetch_book_pages(story_id, reading_level, language_code, _v)
         published_with_images = [(r.get("page_index", i), r.get("image_url")) for i, r in enumerate(all_pages) if r.get("image_url")]
+        # Merge just-approved pages so they appear in the ref dropdown immediately (avoids cache/read-after-write)
+        id_to_page_index = {r.get("id"): r.get("page_index", i) for i, r in enumerate(all_pages)}
+        for row_id, url in (just_approved or {}).items():
+            if (url or "").strip() and row_id in id_to_page_index:
+                pi = id_to_page_index[row_id]
+                if not any(p[0] == pi for p in published_with_images):
+                    published_with_images.append((pi, url.strip()))
+        published_with_images.sort(key=lambda x: x[0])
         ref_page_options = ["None"] + [f"Page {pi}" for pi, _ in published_with_images]
         ref_page_labels = {f"Page {pi}": url for pi, url in published_with_images}
+        ref_page_key = f"ref_page_select_{story_id}_{reading_level}"
+        grade_style_for_ref = _cached_get_story_grade_style(story_id, reading_level, _v)
+        # Initialize from saved style when this story+level key not set (per-context persistence)
+        if ref_page_key not in st.session_state:
+            default_ref = "None"
+            if grade_style_for_ref is not None and grade_style_for_ref.get("reference_page_index") is not None:
+                saved_ref_label = f"Page {grade_style_for_ref['reference_page_index']}"
+                if saved_ref_label in ref_page_options:
+                    default_ref = saved_ref_label
+            st.session_state[ref_page_key] = default_ref
+        # If current value is no longer in options (e.g. that page was removed), reset to None
+        elif st.session_state.get(ref_page_key) not in ref_page_options:
+            st.session_state[ref_page_key] = "None"
         ref_selected = st.selectbox(
             "Use published page as reference",
             options=ref_page_options,
-            key="ref_page_select" if not all_levels_mode else f"ip_refpage_{reading_level}",
+            key=ref_page_key,
         )
         selected_ref_url = ref_page_labels.get(ref_selected) if ref_selected != "None" else None
-        if story_id and reading_level and st.button("Save style for this story & grade", key=f"save_style_{reading_level}" if all_levels_mode else "save_style"):
+        if story_id and reading_level and st.button("Save style for this story & grade", key="save_style"):
+            ref_page_index = None
+            if ref_selected and ref_selected != "None" and ref_selected.startswith("Page "):
+                try:
+                    ref_page_index = int(ref_selected.replace("Page ", "").strip())
+                except ValueError:
+                    pass
             if upsert_story_grade_style(sb, story_id, reading_level, {
                 "age_appropriateness": age_appropriateness or "",
                 "global_style": style_prompt or "",
@@ -596,15 +384,13 @@ def main():
                 "color_palette": color_palette or "",
                 "lighting": lighting or "",
                 "framing": framing or "",
+                "reference_page_index": ref_page_index,
             }):
                 st.success(f"Style saved for {reading_level}.")
                 st.rerun()
 
     # --- Batch status (check pending/running jobs) ---
-    if all_levels_mode:
-        batch_jobs = fetch_batch_jobs_for_story(sb, story_id)
-    else:
-        batch_jobs = fetch_batch_jobs_for_version(sb, story_id, reading_level)
+    batch_jobs = _cached_fetch_batch_jobs_for_version(story_id, reading_level, _v)
     pending_jobs = [j for j in batch_jobs if j.get("status") in ("pending", "running")]
 
     # --- Batch generate ---
@@ -680,10 +466,7 @@ def main():
             with st.expander(f"{job_level} – Batch {job.get('batch_name', '?')} – submitted {created} – Status: {job.get('status', '?')}"):
                 st.caption(f"{job.get('page_count', 0)} pages. Images are generated asynchronously (~24h).")
                 if st.button("Check batch status", key=f"ip_check_{job.get('batch_name', '')}"):
-                    if all_levels_mode:
-                        pages_for_job = fetch_pages_missing_images(sb, story_id, language_code, job_level)
-                    else:
-                        pages_for_job = pages_missing
+                    pages_for_job = pages_missing_display
                     if _check_batch_status(sb, job, pages_for_job, get_gemini):
                         st.rerun()
 
@@ -695,12 +478,12 @@ def main():
 
     st.caption("Images are generated asynchronously. Return to this page later and click Check batch status.")
 
-    if gen_first and pages_missing:
+    if gen_first and pages_missing_display:
         client = get_gemini()
         if not client:
             st.error("Set GEMINI_API_KEY in .env.")
         else:
-            first_row = pages_missing[0]
+            first_row = pages_missing_display[0]
             page_text = (first_row.get("page_text") or first_row.get("text") or "").strip()
             refs = get_reference_images(ref_file, ref_image_url=selected_ref_url)
             with st.spinner("Generating first page..."):
@@ -720,65 +503,11 @@ def main():
             else:
                 st.error("Generation failed.")
 
-    if gen_all:
+    if gen_all and pages_missing_display:
         client = get_gemini()
         if not client:
             st.error("Set GEMINI_API_KEY in .env.")
-        elif all_levels_mode and levels_missing:
-            from google.genai import types
-            refs = get_reference_images(ref_file, ref_image_url=selected_ref_url)
-            gen_config = types.GenerateContentConfig(
-                response_modalities=["TEXT", "IMAGE"],
-                image_config=types.ImageConfig(aspect_ratio="1:1"),
-            )
-            submitted = []
-            try:
-                for level in READING_LEVELS:
-                    pm = levels_missing.get(level, [])
-                    if not pm:
-                        continue
-                    defaults = dict(GRADE_STYLE_DEFAULTS.get(level, GRADE_STYLE_DEFAULTS["grade_1"]))
-                    if story:
-                        for key in ["character_ref", "global_style", "age_appropriateness", "color_palette", "lighting", "framing"]:
-                            if story.get(key) not in (None, ""):
-                                defaults[key] = story[key]
-                    grade_style = get_story_grade_style(sb, story_id, level)
-                    if grade_style:
-                        for key in ["age_appropriateness", "global_style", "character_ref", "color_palette", "lighting", "framing"]:
-                            if grade_style.get(key) not in (None, ""):
-                                defaults[key] = grade_style[key]
-                    ap = defaults.get("age_appropriateness", "")
-                    sp = defaults.get("global_style", "")
-                    cr = defaults.get("character_ref", "")
-                    cp = defaults.get("color_palette", "")
-                    li = defaults.get("lighting", "")
-                    fr = defaults.get("framing", "")
-                    inline_requests = []
-                    for row in pm:
-                        page_text = (row.get("page_text") or row.get("text") or "").strip()
-                        prompt = build_prompt("", page_text, ap, sp, cr, li, cp, fr)
-                        parts = _build_batch_request_parts(prompt, refs if refs else None)
-                        req = types.InlinedRequest(
-                            contents=[{"parts": parts, "role": "user"}],
-                            config=gen_config,
-                        )
-                        inline_requests.append(req)
-                    batch_job = client.batches.create(
-                        model="gemini-3-pro-image-preview",
-                        src=inline_requests,
-                        config={"display_name": f"story-{story_id}-{level}"},
-                    )
-                    batch_name = getattr(batch_job, "name", None) or str(batch_job)
-                    if batch_name and insert_batch_job(sb, batch_name, story_id, level, len(pm)):
-                        submitted.append(f"{level}: {len(pm)} pages")
-                if submitted:
-                    st.success("Submitted batch jobs: " + "; ".join(submitted) + ". Come back later and click Check batch status.")
-                else:
-                    st.warning("No levels had missing pages to submit.")
-                st.rerun()
-            except Exception as e:
-                st.error(f"Batch submission failed: {e}")
-        elif pages_missing:
+        else:
             from google.genai import types
             refs = get_reference_images(ref_file, ref_image_url=selected_ref_url)
             gen_config = types.GenerateContentConfig(
@@ -786,7 +515,7 @@ def main():
                 image_config=types.ImageConfig(aspect_ratio="1:1"),
             )
             inline_requests = []
-            for row in pages_missing:
+            for row in pages_missing_display:
                 page_text = (row.get("page_text") or row.get("text") or "").strip()
                 prompt = build_prompt(
                     "",
@@ -811,7 +540,7 @@ def main():
                     config={"display_name": f"story-{story_id}-{reading_level}"},
                 )
                 batch_name = getattr(batch_job, "name", None) or str(batch_job)
-                if batch_name and insert_batch_job(sb, batch_name, story_id, reading_level, len(pages_missing)):
+                if batch_name and insert_batch_job(sb, batch_name, story_id, reading_level, len(pages_missing_display)):
                     st.success(f"Batch submitted. Job ID: {batch_name}. Come back later and click Check batch status below.")
                 else:
                     st.error("Failed to save batch job to database.")
@@ -820,19 +549,16 @@ def main():
                 st.error(f"Batch submission failed: {e}")
 
     # --- Review all pages: see images, approve (export to R2 + Supabase) or regenerate ---
-    if all_levels_mode:
-        review_level = st.selectbox(
-            "Review level",
-            options=READING_LEVELS,
-            key="ip_review_level",
-            format_func=lambda x: x.replace("_", " ").title(),
-        )
-    else:
-        review_level = reading_level
-    all_pages_for_review = fetch_book_pages(sb, story_id, review_level, language_code)
+    all_pages_for_review = _cached_fetch_book_pages(story_id, reading_level, language_code, _v)
+    # Merge just-approved URLs so UI shows them immediately (avoids stale cache / read-after-write)
+    if just_approved:
+        for row in all_pages_for_review:
+            rid = row.get("id")
+            if rid in just_approved:
+                row["image_url"] = just_approved[rid]
     pending = st.session_state.get("ip_pending_images", {})
     st.header("4. Review pages")
-    st.caption("View generated images. Approve to export to R2 and save URL to Supabase. Regenerate to try again.")
+    st.caption("View generated images. Approve to export to R2 and save URL to Supabase. Regenerate to try again. Clear image to remove and include the page in the next batch.")
     for row in all_pages_for_review:
         row_id = row.get("id")
         page_text = (row.get("page_text") or row.get("text") or "").strip()
@@ -847,44 +573,41 @@ def main():
                 st.image(pending[row_id], caption=f"Page {page_idx} (pending approval)", use_container_width=False)
                 st.caption("Approve to export to R2 and save to Supabase.")
             elif has_published:
-                img_bytes = fetch_image_for_display(img_url)
-                if img_bytes:
-                    st.image(img_bytes, caption=f"Page {page_idx}", use_container_width=False)
+                st.image(img_url, caption=f"Page {page_idx}", use_container_width=False)
             else:
                 st.caption("No image yet.")
-            edited_text = st.text_area("Page text", value=page_text, key=f"regen_text_{row_id}", height=60)
+            edited_text = st.text_area(
+                "Page text (for API only)",
+                value=page_text,
+                key=f"regen_text_{row_id}",
+                height=60,
+                help="Edit here to fix prompt/API errors. Only the text sent to the image API changes; your stored page text in the database is not updated.",
+            )
             correction = st.text_input("Correction (optional)", key=f"regen_corr_{row_id}", placeholder="e.g. Add a dragon in the background")
-            btn_col1, btn_col2 = st.columns(2)
+            btn_col1, btn_col2, btn_col3 = st.columns(3)
             with btn_col1:
-                if has_pending and st.button("Approve (export to R2 + Supabase)", key=f"approve_btn_{row_id}", type="primary"):
+                if has_pending and st.button("Approve", key=f"approve_btn_{row_id}", type="primary"):
                     opt = pending[row_id]
-                    url = upload_to_storage(sb, story_id, review_level, int(page_idx), opt)
-                    if url:
-                        update_book_page(sb, row_id, image_url=url, page_text=(edited_text or page_text).strip())
-                        del pending[row_id]
-                        st.session_state["ip_pending_images"] = pending
-                        st.success("Exported to R2 and saved to Supabase.")
-                        st.rerun()
+                    url = upload_image_to_storage(sb, story_id, reading_level, int(page_idx), opt)
+                    if url and (url or "").strip():
+                        if update_book_page(sb, row_id, image_url=url):
+                            del pending[row_id]
+                            st.session_state["ip_pending_images"] = pending
+                            st.session_state["ip_cache_version"] = st.session_state.get("ip_cache_version", 0) + 1
+                            # So UI shows the new URL immediately after rerun (avoids stale cache/read-after-write)
+                            just_approved = st.session_state.get("ip_just_approved") or {}
+                            just_approved[row_id] = url
+                            st.session_state["ip_just_approved"] = just_approved
+                            st.success("Exported to R2 and saved to Supabase.")
+                            st.rerun()
+                        else:
+                            st.error("Saved to R2 but failed to save URL to Supabase. Try again.")
                     else:
                         st.error("Upload failed.")
             with btn_col2:
                 if st.button("Regenerate" if (has_pending or has_published) else "Generate", key=f"regen_btn_{row_id}"):
                     extra = (correction or "").strip()
-                    # Use style for review_level (in all_levels_mode we need that level's style)
-                    if all_levels_mode:
-                        gs = get_story_grade_style(sb, story_id, review_level)
-                        defs = dict(GRADE_STYLE_DEFAULTS.get(review_level, GRADE_STYLE_DEFAULTS["grade_1"]))
-                        if story:
-                            for k in ["character_ref", "global_style", "age_appropriateness", "color_palette", "lighting", "framing"]:
-                                if story.get(k) not in (None, ""):
-                                    defs[k] = story[k]
-                        if gs:
-                            for k in ["age_appropriateness", "global_style", "character_ref", "color_palette", "lighting", "framing"]:
-                                if gs.get(k) not in (None, ""):
-                                    defs[k] = gs[k]
-                        ap, sp, cr, li, cp, fr = defs.get("age_appropriateness", ""), defs.get("global_style", ""), defs.get("character_ref", ""), defs.get("lighting", ""), defs.get("color_palette", ""), defs.get("framing", "")
-                    else:
-                        ap, sp, cr, li, cp, fr = age_appropriateness or "", style_prompt or "", character_ref or "", lighting or "", color_palette or "", framing or ""
+                    ap, sp, cr, li, cp, fr = age_appropriateness or "", style_prompt or "", character_ref or "", lighting or "", color_palette or "", framing or ""
                     prompt = build_prompt(
                         extra,
                         (edited_text or page_text).strip(),
@@ -901,6 +624,17 @@ def main():
                         st.rerun()
                     else:
                         st.error("Generation failed.")
+            with btn_col3:
+                if (has_pending or has_published) and st.button("Clear image", key=f"clear_btn_{row_id}", help="Remove image so this page is included in the next batch."):
+                    if update_book_page(sb, row_id, image_url=""):
+                        if row_id in pending:
+                            del pending[row_id]
+                            st.session_state["ip_pending_images"] = pending
+                        st.session_state["ip_cache_version"] = st.session_state.get("ip_cache_version", 0) + 1
+                        st.success("Image cleared. Page will be included in the next batch.")
+                        st.rerun()
+                    else:
+                        st.error("Failed to clear image.")
 
 
 if __name__ == "__main__":

@@ -55,7 +55,7 @@ def run_story_text_view():
     st.header("2. Paste & split")
     paste_raw = st.text_area(
         "Paste full story",
-        placeholder="Paste the whole story. Use the delimiter below to separate pages (e.g. --- or one paragraph per line).",
+        placeholder="Paste the whole story. Use the delimiter below to separate pages (e.g. # or one paragraph per line).",
         height=180,
         key="st_paste_raw",
     )
@@ -63,26 +63,36 @@ def run_story_text_view():
     with delim_col:
         page_delimiter = st.text_input(
             "Page delimiter",
-            value="---",
+            value="#",
             key="st_page_delimiter",
-            help="Split by this (e.g. ---). Type \\n or newline for one paragraph per line.",
+            help="Split by this (e.g. #). Type \\n or newline for one paragraph per line.",
         )
     with split_col:
         do_split = st.button("Preview split", type="primary", key="st_do_split")
 
-    segments = st.session_state.get("st_segments", [])
+    # Store segments per (story_id, reading_level, language_code) so preview persists when switching and coming back
+    def _cache_key(sid, lev, lang):
+        return f"{sid}|{lev}|{lang}"
+
+    if "st_segments_cache" not in st.session_state:
+        st.session_state["st_segments_cache"] = {}
+    cache = st.session_state["st_segments_cache"]
+    version_key = _cache_key(story_id, reading_level, language_code)
+    segments = list(cache.get(version_key, []))  # copy so we don't mutate cached list
+
     if do_split and paste_raw and paste_raw.strip():
-        delim = (page_delimiter or "---").strip()
+        delim = (page_delimiter or "#").strip()
         if delim == "\\n" or delim.lower() == "newline":
             segments = [s.strip() for s in paste_raw.strip().splitlines() if s.strip()]
         else:
             segments = [s.strip() for s in paste_raw.strip().split(delim) if s.strip()]
-        st.session_state["st_segments"] = segments
+        cache[version_key] = segments
+        st.session_state["st_segments_cache"] = dict(cache)  # trigger session state update
         if segments:
             st.success(f"Split into **{len(segments)}** pages. Review below, then click Save to Supabase.")
         else:
             st.warning("No non-empty segments. Check your delimiter.")
-            st.session_state["st_segments"] = []
+            cache[version_key] = []
     elif do_split and (not paste_raw or not paste_raw.strip()):
         st.warning("Paste some story text first.")
 
@@ -95,12 +105,6 @@ def run_story_text_view():
         st.divider()
 
     # --- Save ---
-    st.header("4. Save to Supabase")
-    save_to_all_levels = st.checkbox(
-        "Save to all reading levels",
-        key="st_save_all_levels",
-        help="Apply the same split text to all 5 grades (grade_1–grade_5) for this story and language.",
-    )
     st.caption(
         "Save will replace all existing pages for this story + reading level + language with the split result. "
         "Existing images will be lost; run Image Processor to regenerate."
@@ -133,8 +137,9 @@ def run_story_text_view():
                         break
                 else:
                     st.success(f"Saved {total_saved} pages to story_content_flat ({len(levels_to_save)} level(s)).")
-                    if "st_segments" in st.session_state:
-                        del st.session_state["st_segments"]
+                    seg_cache = st.session_state.get("st_segments_cache", {})
+                    for lev in levels_to_save:
+                        seg_cache.pop(f"{sid}|{lev}|{lang}", None)
                 del st.session_state["st_save_confirm_pending"]
                 del st.session_state["st_save_confirm_data"]
                 st.rerun()
@@ -150,7 +155,7 @@ def run_story_text_view():
         if not segments:
             st.warning("Split the story first to get pages.")
         else:
-            levels_to_save = READING_LEVELS if save_to_all_levels else [reading_level]
+            levels_to_save = [reading_level]
             levels_with_content = [
                 lev for lev in levels_to_save
                 if fetch_book_pages(sb, story_id, lev, language_code)
@@ -177,6 +182,7 @@ def run_story_text_view():
                         break
                 else:
                     st.success(f"Saved {total_saved} pages to story_content_flat ({len(levels_to_save)} level(s)).")
-                    if "st_segments" in st.session_state:
-                        del st.session_state["st_segments"]
+                    seg_cache = st.session_state.get("st_segments_cache", {})
+                    for lev in levels_to_save:
+                        seg_cache.pop(f"{story_id}|{lev}|{language_code}", None)
                     st.rerun()

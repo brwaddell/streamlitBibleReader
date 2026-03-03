@@ -82,7 +82,7 @@ streamlit run app.py
 ## Flow
 
 1. **Select story & reading level** – Choose from `stories` table and a reading level (grade_1–grade_5).
-2. **Paste story text** – Enter raw text and set a delimiter (default `---`) to split into pages.
+2. **Paste story text** – Enter raw text and set a delimiter (default `#`) to split into pages.
 3. **Set image controls** – Global style, character reference, color palette, negative prompt.
 4. **Generate** – Generate images per page or in bulk. Approve or regenerate with correction instructions.
 5. **Export** – Upload approved images to R2 and insert rows into `story_content_flat`.

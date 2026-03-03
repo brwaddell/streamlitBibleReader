@@ -10,8 +10,12 @@ CREATE TABLE IF NOT EXISTS story_grade_styles (
   color_palette text,
   lighting text,
   framing text,
+  reference_page_index integer,
   PRIMARY KEY (story_id, reading_level)
 );
 
 -- Optional: enable RLS and add policies if your project uses Row Level Security.
 -- ALTER TABLE story_grade_styles ENABLE ROW LEVEL SECURITY;
+
+-- If the table already exists, add the reference page column with:
+-- ALTER TABLE story_grade_styles ADD COLUMN IF NOT EXISTS reference_page_index integer;
