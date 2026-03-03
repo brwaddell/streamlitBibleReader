@@ -100,7 +100,9 @@ def _cached_fetch_stories(_cache_version: int):
 
 
 @st.cache_data(ttl=_IP_CACHE_TTL, show_spinner=False)
-def _cached_fetch_pages_missing_images(story_id: int, language_code: str, reading_level: str, _cache_version: int):
+def _cached_fetch_pages_missing_images(
+    story_id: int, language_code: str, reading_level: str, _cache_version: int, _cache_version_missing: int = 0
+):
     sb = get_supabase()
     return fetch_pages_missing_images(sb, story_id, language_code, reading_level) if sb else []
 
@@ -135,7 +137,8 @@ def init_session_state():
         "openai_client": None,
         "gemini_client": None,
         "ip_pending_images": {},  # row_id -> optimized image bytes (awaiting approve)
-        "ip_cache_version": 0,  # bumped on Approve so cache invalidates and data refreshes
+        "ip_cache_version": 0,  # bumped when full refetch needed
+        "ip_pages_missing_version": 0,  # bumped on clear/approve so pages_missing count refreshes
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -277,9 +280,11 @@ def main():
         st.info("Select a story to continue.")
         return
 
-    # Pop just_approved early so we treat just-approved rows as no longer missing (avoids stale refetch showing them still missing)
+    # Pop just_approved / just_cleared early so we treat them correctly (avoids stale refetch)
     just_approved = st.session_state.pop("ip_just_approved", None) or {}
-    pages_missing = _cached_fetch_pages_missing_images(story_id, language_code, reading_level, _v)
+    just_cleared = set(st.session_state.pop("ip_just_cleared", None) or [])
+    _v_missing = st.session_state.get("ip_pages_missing_version", 0)
+    pages_missing = _cached_fetch_pages_missing_images(story_id, language_code, reading_level, _v, _v_missing)
     pages_missing_display = [r for r in pages_missing if r.get("id") not in just_approved]
     if pages_missing_display:
         st.success(f"**{len(pages_missing_display)}** pages missing images.")
@@ -340,7 +345,7 @@ def main():
             key="ref_image",
         )
         all_pages = _cached_fetch_book_pages(story_id, reading_level, language_code, _v)
-        published_with_images = [(r.get("page_index", i), r.get("image_url")) for i, r in enumerate(all_pages) if r.get("image_url")]
+        published_with_images = [(r.get("page_index", i), r.get("image_url")) for i, r in enumerate(all_pages) if r.get("image_url") and r.get("id") not in just_cleared]
         # Merge just-approved pages so they appear in the ref dropdown immediately (avoids cache/read-after-write)
         id_to_page_index = {r.get("id"): r.get("page_index", i) for i, r in enumerate(all_pages)}
         for row_id, url in (just_approved or {}).items():
@@ -550,12 +555,17 @@ def main():
 
     # --- Review all pages: see images, approve (export to R2 + Supabase) or regenerate ---
     all_pages_for_review = _cached_fetch_book_pages(story_id, reading_level, language_code, _v)
-    # Merge just-approved URLs so UI shows them immediately (avoids stale cache / read-after-write)
+    # Merge just-approved URLs so UI shows them immediately (no refetch delay)
     if just_approved:
         for row in all_pages_for_review:
             rid = row.get("id")
             if rid in just_approved:
                 row["image_url"] = just_approved[rid]
+    # Apply just-cleared so UI shows removed image immediately (no refetch delay)
+    if just_cleared:
+        for row in all_pages_for_review:
+            if row.get("id") in just_cleared:
+                row["image_url"] = ""
     pending = st.session_state.get("ip_pending_images", {})
     st.header("4. Review pages")
     st.caption("View generated images. Approve to export to R2 and save URL to Supabase. Regenerate to try again. Clear image to remove and include the page in the next batch.")
@@ -593,8 +603,8 @@ def main():
                         if update_book_page(sb, row_id, image_url=url):
                             del pending[row_id]
                             st.session_state["ip_pending_images"] = pending
-                            st.session_state["ip_cache_version"] = st.session_state.get("ip_cache_version", 0) + 1
-                            # So UI shows the new URL immediately after rerun (avoids stale cache/read-after-write)
+                            # Bump only pages_missing so count updates; keep book_pages cached so UI shows new URL instantly via just_approved
+                            st.session_state["ip_pages_missing_version"] = st.session_state.get("ip_pages_missing_version", 0) + 1
                             just_approved = st.session_state.get("ip_just_approved") or {}
                             just_approved[row_id] = url
                             st.session_state["ip_just_approved"] = just_approved
@@ -630,7 +640,11 @@ def main():
                         if row_id in pending:
                             del pending[row_id]
                             st.session_state["ip_pending_images"] = pending
-                        st.session_state["ip_cache_version"] = st.session_state.get("ip_cache_version", 0) + 1
+                        # Bump only pages_missing so count updates; keep book_pages cached so UI shows cleared state instantly via just_cleared
+                        st.session_state["ip_pages_missing_version"] = st.session_state.get("ip_pages_missing_version", 0) + 1
+                        just_cleared_ids = list(st.session_state.get("ip_just_cleared") or [])
+                        just_cleared_ids.append(row_id)
+                        st.session_state["ip_just_cleared"] = just_cleared_ids
                         st.success("Image cleared. Page will be included in the next batch.")
                         st.rerun()
                     else:
