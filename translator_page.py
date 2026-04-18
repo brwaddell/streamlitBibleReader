@@ -1,7 +1,7 @@
 """
-Translator Page: Localize existing English stories via OpenAI.
-Select source story (English) → choose target language & reading level →
-AI translates each page → side-by-side editor → save to Supabase (story_content_flat).
+Translator Page: Localize existing English stories into Spanish via OpenAI.
+Select source story (English) → reading level → AI translates each page →
+side-by-side editor → save to Supabase (story_content_flat).
 """
 
 from typing import List, Optional
@@ -18,17 +18,10 @@ from lib import (
     insert_book_page,
 )
 
-# Target languages: (display name, language_code for DB + prompt)
-TARGET_LANGUAGES = [
-    ("Spanish", "es", "Spanish"),
-    ("French", "fr", "French"),
-    ("German", "de", "German"),
-    ("Italian", "it", "Italian"),
-    ("Portuguese", "pt", "Portuguese"),
-    ("Dutch", "nl", "Dutch"),
-    ("Japanese", "ja", "Japanese"),
-    ("Korean", "ko", "Korean"),
-]
+# Product ships Spanish only as translation target (no dropdown).
+TARGET_LANG_DISPLAY = "Spanish"
+TARGET_LANG_CODE = "es"
+TARGET_LANG_PROMPT_NAME = "Spanish"
 
 # Reading level display for prompts (friendly names)
 READING_LEVEL_LABELS = {
@@ -82,10 +75,36 @@ def translate_page_text(
         return None
 
 
-def run_translator_view():
+def apply_translator_target_to_audio_language():
+    """Default Audio Generator language to Spanish (wizard handoff)."""
+    st.session_state["ag_language"] = TARGET_LANG_CODE
+
+
+def _maybe_wizard_jump_after_translate_save(next_step: Optional[str]):
+    if not next_step:
+        return
+    if st.session_state.get("wiz_auto_next_audio"):
+        apply_translator_target_to_audio_language()
+        st.session_state["setup_wizard_step"] = next_step
+
+
+def run_translator_view(
+    *,
+    as_wizard_step: bool = False,
+    wizard_after_save_step: Optional[str] = None,
+):
     """Render the Translator page: story + grade + target language; translate only missing rows (like Audio Generator)."""
-    st.title("Story Translator")
-    st.caption("Source is always English. Select story, grade level, and target language; translate only pages that don't have a translation yet.")
+    if as_wizard_step:
+        st.caption(
+            "Source is always English. Pick story and grade level; "
+            "translations are **Spanish** only. Only pages missing a Spanish row are filled."
+        )
+    else:
+        st.title("Story Translator")
+        st.caption(
+            "Source is always English. Target language is **Spanish** (`es`). "
+            "Translates only pages that don't have a Spanish row yet."
+        )
 
     sb = get_supabase()
     if not sb:
@@ -97,7 +116,7 @@ def run_translator_view():
         return
 
     # --- Story ID + Mode + Grade level (if single) + Target language ---
-    st.header("1. Select story & target")
+    st.header("1. Select story & target" if not as_wizard_step else "Select story & target")
     col1, col2 = st.columns(2)
     with col1:
         story_options = {f"{s['title']} (id: {s['id']})": s["id"] for s in stories}
@@ -108,15 +127,11 @@ def run_translator_view():
         )
         story_id = story_options.get(story_label) if story_label else None
     with col2:
-        target_options = [(name, code, prompt_name) for name, code, prompt_name in TARGET_LANGUAGES]
-        target_lang_display = st.selectbox(
-            "Target language",
-            options=[t[0] for t in target_options],
-            key="tr_target_lang",
-        )
-        target_entry = next(t for t in target_options if t[0] == target_lang_display)
-        target_lang_code = target_entry[1]
-        target_lang_prompt_name = target_entry[2]
+        st.caption("Target language")
+        st.markdown(f"**{TARGET_LANG_DISPLAY}** (`{TARGET_LANG_CODE}`)")
+        target_lang_display = TARGET_LANG_DISPLAY
+        target_lang_code = TARGET_LANG_CODE
+        target_lang_prompt_name = TARGET_LANG_PROMPT_NAME
 
     tr_all_levels = st.radio(
         "Mode",
@@ -176,11 +191,11 @@ def run_translator_view():
         else:
             st.info(
                 f"No pages missing translation for **{target_lang_display}** (Story {story_id}, {reading_level}). "
-                "All English pages already have a translation, or there are no English pages. Add English pages in Book Pages first."
+                "All English pages already have a translation, or there are no English pages. Add English pages in Story Text Parser or Story Content Manager first."
             )
 
     # --- Translate (only missing pages) ---
-    st.header("2. Translate")
+    st.header("2. Translate" if not as_wizard_step else "Translate")
     openai_client = get_openai()
     if not openai_client:
         st.error("Set OPENAI_API_KEY in .env to use the translator.")
@@ -284,7 +299,7 @@ def run_translator_view():
             has_pages = False
 
     if has_levels:
-        st.header("3. Review & edit")
+        st.header("3. Review & edit" if not as_wizard_step else "Review & edit")
         st.caption("Edit the translated text on the right, then **Save to Supabase**. Select a level to review.")
         review_level = st.selectbox(
             "Review level",
@@ -340,6 +355,7 @@ def run_translator_view():
                 del st.session_state["tr_result"]
             if "tr_edited" in st.session_state:
                 del st.session_state["tr_edited"]
+            _maybe_wizard_jump_after_translate_save(wizard_after_save_step)
             st.rerun()
         if st.button("Clear and translate again", key="tr_clear"):
             if "tr_result" in st.session_state:
@@ -349,7 +365,7 @@ def run_translator_view():
             st.rerun()
 
     elif has_pages:
-        st.header("3. Review & edit")
+        st.header("3. Review & edit" if not as_wizard_step else "Review & edit")
         st.caption("Edit the translated text on the right. Click **Save to Supabase** when ready.")
         if "tr_edited" not in st.session_state:
             st.session_state.tr_edited = {p["page_index"]: p["translated_text"] for p in result["pages"]}
@@ -396,6 +412,7 @@ def run_translator_view():
                 del st.session_state["tr_result"]
             if "tr_edited" in st.session_state:
                 del st.session_state["tr_edited"]
+            _maybe_wizard_jump_after_translate_save(wizard_after_save_step)
             st.rerun()
         if st.button("Clear and translate again", key="tr_clear"):
             if "tr_result" in st.session_state:

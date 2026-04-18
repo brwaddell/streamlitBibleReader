@@ -4,6 +4,8 @@ Creates or replaces page text for a given story + reading level + language.
 No images; use Image Processor to generate those.
 """
 
+from typing import Optional
+
 import streamlit as st
 
 from lib import (
@@ -17,10 +19,25 @@ from lib import (
 )
 
 
-def run_story_text_view():
+def _maybe_wizard_jump_after_story_text_save(next_step: Optional[str]):
+    """If Story Setup wizard asked for auto-advance, move the step radio and clear flag."""
+    if not next_step:
+        return
+    if st.session_state.get("wiz_auto_next_translate"):
+        st.session_state["setup_wizard_step"] = next_step
+
+
+def run_story_text_view(
+    *,
+    as_wizard_step: bool = False,
+    wizard_after_save_step: Optional[str] = None,
+):
     """Render the Story Text page: paste, split by delimiter, save to Supabase."""
-    st.title("Story Text")
-    st.caption("Paste full story, split by delimiter, save to story_content_flat. Use Image Processor to generate images.")
+    if as_wizard_step:
+        st.caption("Paste full story, split by delimiter, save to story_content_flat. Use Image Processor to generate images.")
+    else:
+        st.title("Story Text Parser")
+        st.caption("Paste full story, split by delimiter, save to story_content_flat. Use Image Processor to generate images.")
 
     sb = get_supabase()
     if not sb:
@@ -32,7 +49,7 @@ def run_story_text_view():
         return
 
     # --- Filters ---
-    st.header("1. Select story & version")
+    st.header("1. Select story & version" if not as_wizard_step else "Select story & version")
     col1, col2, col3 = st.columns(3)
     with col1:
         story_options = {f"{s['title']} (id: {s['id']})": s["id"] for s in stories}
@@ -52,7 +69,7 @@ def run_story_text_view():
         return
 
     # --- Paste & split ---
-    st.header("2. Paste & split")
+    st.header("2. Paste & split" if not as_wizard_step else "Paste & split")
     paste_raw = st.text_area(
         "Paste full story",
         placeholder="Paste the whole story. Use the delimiter below to separate pages (e.g. # or one paragraph per line).",
@@ -98,7 +115,7 @@ def run_story_text_view():
 
     # Show segments for review
     if segments:
-        st.header("3. Review pages")
+        st.header("3. Review pages" if not as_wizard_step else "Review pages")
         for i, seg in enumerate(segments):
             with st.expander(f"Page {i}", expanded=True):
                 st.text(seg)
@@ -142,6 +159,7 @@ def run_story_text_view():
                         seg_cache.pop(f"{sid}|{lev}|{lang}", None)
                 del st.session_state["st_save_confirm_pending"]
                 del st.session_state["st_save_confirm_data"]
+                _maybe_wizard_jump_after_story_text_save(wizard_after_save_step)
                 st.rerun()
         with col2:
             if st.button("Cancel", key="st_cancel_overwrite"):
@@ -185,4 +203,5 @@ def run_story_text_view():
                     seg_cache = st.session_state.get("st_segments_cache", {})
                     for lev in levels_to_save:
                         seg_cache.pop(f"{story_id}|{lev}|{language_code}", None)
+                    _maybe_wizard_jump_after_story_text_save(wizard_after_save_step)
                     st.rerun()

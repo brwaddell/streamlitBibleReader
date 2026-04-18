@@ -1,6 +1,6 @@
 # Storybook Image Processor
 
-Bulk image generation for storybook apps. Paste story text, split into pages, generate images via Nano Banana Pro (Gemini 3 Pro Image), use OpenAI GPT for extra-details hints, review/approve or regenerate with corrections, then export to Cloudflare R2 and insert URLs into `story_content_flat`.
+Bulk image generation for storybook apps. Paste story text, split into pages, generate images with **Gemini** (e.g. `gemini-3-pro-image-preview`) or **Leonardo.ai**, use **OpenAI** for structured scene prompts, review/approve or regenerate, then export to Cloudflare R2 and insert URLs into `story_content_flat`.
 
 ## Setup
 
@@ -24,8 +24,9 @@ Bulk image generation for storybook apps. Paste story text, split into pages, ge
    - `SUPABASE_URL` – your Supabase project URL
    - `SUPABASE_ANON_KEY` – Supabase anon/public key (for auth login)
    - `SUPABASE_SERVICE_KEY` – Supabase service_role key (for database)
-   - `OPENAI_API_KEY` – from [OpenAI](https://platform.openai.com/api-keys) (extra-details hints)
-   - `GEMINI_API_KEY` – from [Google AI Studio](https://aistudio.google.com/apikey) (Nano Banana Pro)
+   - `OPENAI_API_KEY` – from [OpenAI](https://platform.openai.com/api-keys) (scene prompt suggestions)
+   - `GEMINI_API_KEY` – from [Google AI Studio](https://aistudio.google.com/apikey) (Gemini image generation)
+   - `LEONARDO_API_KEY`, `LEONARDO_MODEL_ID` – from [Leonardo.ai API](https://docs.leonardo.ai/) (optional; set Image Processor provider to Leonardo)
    - `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` – from [Cloudflare R2](https://developers.cloudflare.com/r2/) (images + audio storage)
    - `R2_PUBLIC_URL_IMAGES`, `R2_PUBLIC_URL_AUDIO` – public URLs for your R2 buckets (e.g. `https://pub-xxx.r2.dev` or custom domain)
 
@@ -43,7 +44,14 @@ Bulk image generation for storybook apps. Paste story text, split into pages, ge
    - Enable **Public access** on each bucket (or use custom domains)
    - Copy the public URL (e.g. `https://pub-xxxxx.r2.dev`) into `R2_PUBLIC_URL_IMAGES` and `R2_PUBLIC_URL_AUDIO`
 
-6. **Optional: Per-story character/style** (Image Processor):
+6. **Supabase SQL (Leonardo job queue + style columns)**:
+
+   Run in the SQL Editor (once per project):
+
+   - [`supabase_image_generation_jobs.sql`](supabase_image_generation_jobs.sql) – per-page Leonardo async jobs
+   - [`supabase_story_grade_styles_leonardo.sql`](supabase_story_grade_styles_leonardo.sql) – `character_reference_image_url`, `leonardo_seed`, `default_image_provider` on `story_grade_styles`
+
+7. **Optional: Per-story character/style** (Image Processor → **Settings** tab):
 
    To use different characters or styles per story (instead of the default Noah style), add optional columns to your `stories` table in Supabase. The app will use them when you select that story:
 
@@ -71,7 +79,7 @@ streamlit run app.py
 
 4. Open **Advanced settings** and add these secrets (as key-value pairs):
    - `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_KEY`
-   - `OPENAI_API_KEY`, `GEMINI_API_KEY`
+   - `OPENAI_API_KEY`, `GEMINI_API_KEY`, and if using Leonardo: `LEONARDO_API_KEY`, `LEONARDO_MODEL_ID`
    - `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`
    - `R2_PUBLIC_URL_IMAGES`, `R2_PUBLIC_URL_AUDIO`
 
@@ -83,9 +91,9 @@ streamlit run app.py
 
 1. **Select story & reading level** – Choose from `stories` table and a reading level (grade_1–grade_5).
 2. **Paste story text** – Enter raw text and set a delimiter (default `#`) to split into pages.
-3. **Set image controls** – Global style, character reference, color palette, negative prompt.
-4. **Generate** – Generate images per page or in bulk. Approve or regenerate with correction instructions.
-5. **Export** – Upload approved images to R2 and insert rows into `story_content_flat`.
+3. **Image Processor → Settings (optional)** – Reference image URL, Leonardo seed, default provider (Gemini vs Leonardo), and style fields saved to `story_grade_styles`.
+4. **Image Processor → Workflow** – Scene prompts (OpenAI suggestions + edits), then **Gemini** (including batch API) or **Leonardo** (submit queue + check jobs).
+5. **Review** – Approve to R2 + `story_content_flat`, regenerate, bulk approve, or clear images.
 
 ## Storage Layout (Cloudflare R2)
 

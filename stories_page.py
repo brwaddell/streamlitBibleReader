@@ -7,7 +7,7 @@ from lib import delete_story, fetch_stories, get_supabase, insert_story, update_
 
 def run_stories_view():
     """Render a simple Stories list: each story in an expander with inline edit and free/published toggles."""
-    st.title("Stories")
+    st.title("Story Titles")
     st.caption("Edit title, description, and set Free / Published per story.")
 
     sb = get_supabase()

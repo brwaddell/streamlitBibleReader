@@ -1,18 +1,34 @@
 """Shared utilities for Storybook Image Processor."""
 import base64
+import json
 import os
 import time
 from io import BytesIO
-from typing import List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 import streamlit as st
 from PIL import Image
 
 from auth import get_secret
+from scene_prompts import (
+    LEONARDO_ILLUSTRATOR_LOCK,
+    LEONARDO_NEGATIVE_IMAGE_HARD_RULES,
+    LEONARDO_NEGATIVE_KID_SOFT,
+    LEONARDO_POSITIVE_IMAGE_RULES,
+    SCENE_HARD_RULES,
+)
 
 READING_LEVELS = ["grade_1", "grade_2", "grade_3", "grade_4", "grade_5"]
-LANGUAGE_CODES = ["en", "es", "fr"]  # Extend as needed
+# Languages offered in Story Text / Audio / Book Pages dropdowns (English + Spanish only).
+LANGUAGE_CODES = ["en", "es"]
+
+
+def ui_language_select_options(versions: List[dict]) -> List[str]:
+    """Intersect Supabase version codes with LANGUAGE_CODES; default to full UI list if none match."""
+    from_db = {v.get("language_code") for v in (versions or []) if v.get("language_code")}
+    filtered = sorted(from_db & set(LANGUAGE_CODES))
+    return filtered if filtered else list(LANGUAGE_CODES)
 
 # ElevenLabs voice options (name, voice_id, description) — shared by Audio Generator and Book Pages
 VOICES_MALE = [
@@ -27,10 +43,210 @@ VOICES_FEMALE = [
     ("Emma Taylor", "S9EGwlCtMF7VXtENq79v", "Gentle, thoughtful"),
     ("Rachel", "21m00Tcm4TlvDq8ikWAM", "Professional, warm"),
 ]
+
+# Audio Generator batch: ElevenLabs quality model, fixed narrators, per-grade playback speed.
+ELEVENLABS_TTS_MODEL_ID = "eleven_multilingual_v2"
+ELEVENLABS_TTS_OUTPUT_FORMAT = "mp3_44100_128"
+ELEVENLABS_VOICE_MALE_DEFAULT = "8JVbfL6oEdmuxKn5DK2C"  # Johnny Kid
+ELEVENLABS_VOICE_FEMALE_DEFAULT = "jqcCZkN6Knx8BJ5TBdYR"  # Zara
+AUDIO_TTS_SPEED_BY_GRADE = {
+    "grade_1": 0.75,
+    "grade_2": 0.8,
+    "grade_3": 0.8,
+    "grade_4": 0.8,
+    "grade_5": 0.9,
+}
+
+
+def audio_tts_speed_for_grade(reading_level: str) -> float:
+    return AUDIO_TTS_SPEED_BY_GRADE.get(reading_level or "", 0.8)
+
+
 STORAGE_BUCKET = "storybook-images"
 AUDIO_BUCKET = "storybook-audio"
 MAX_IMAGE_SIZE = 800
 TARGET_BYTES = 100_000
+
+# One reference image for Gemini and Leonardo (Leonardo rejects multiple character-reference controlnets).
+MAX_REFERENCE_IMAGES = 1
+LEONARDO_MAX_CHARACTER_REFERENCE_REFS = 1
+
+
+def parse_reference_images_json(raw: Any) -> List[Dict[str, str]]:
+    """Normalize DB / JSON value to a list of {label, url} with non-empty URLs."""
+    if raw is None:
+        return []
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return []
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return []
+    if not isinstance(raw, list):
+        return []
+    out: List[Dict[str, str]] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        url = str(item.get("url") or "").strip()
+        if not url:
+            continue
+        lab = str(item.get("label") or "").strip() or "Reference"
+        out.append({"label": lab, "url": url})
+    return out[:MAX_REFERENCE_IMAGES]
+
+
+def seed_reference_text_slots(
+    story_id: int,
+    reading_level: str,
+    max_slots: int,
+    key_prefix: str,
+    entries: List[Dict[str, str]],
+) -> None:
+    """Initialize label/URL text_input session keys from saved reference list.
+
+    Must run before Streamlit creates widgets for those keys on the same run, or Streamlit raises.
+    """
+    for i in range(max_slots):
+        lk = f"{key_prefix}_l_{story_id}_{reading_level}_{i}"
+        uk = f"{key_prefix}_u_{story_id}_{reading_level}_{i}"
+        if i < len(entries):
+            st.session_state[lk] = str(entries[i].get("label") or "")
+            st.session_state[uk] = str(entries[i].get("url") or "")
+        else:
+            st.session_state[lk] = ""
+            st.session_state[uk] = ""
+
+
+def reference_entries_from_text_slots(
+    story_id: int,
+    reading_level: str,
+    max_slots: int,
+    key_prefix: str,
+) -> List[Dict[str, str]]:
+    """Read label/URL from fixed Streamlit text_input keys; skip rows with empty URL."""
+    out: List[Dict[str, str]] = []
+    for i in range(max_slots):
+        lk = f"{key_prefix}_l_{story_id}_{reading_level}_{i}"
+        uk = f"{key_prefix}_u_{story_id}_{reading_level}_{i}"
+        url = (st.session_state.get(uk) or "").strip()
+        if not url:
+            continue
+        lab = (st.session_state.get(lk) or "").strip() or "Reference"
+        out.append({"label": lab, "url": url})
+    return out
+
+
+def format_visual_reference_instructions(labels: List[str]) -> str:
+    """Prompt text so the model maps each supplied image index to a named design."""
+    if not labels:
+        return ""
+    bits = [
+        f"Image {i} ({lab}): match this design whenever it appears; keep it consistent across the series."
+        for i, lab in enumerate(labels, start=1)
+    ]
+    return "VISUAL REFERENCE IMAGES are provided in order. " + " ".join(bits)
+
+
+def _normalize_ref_url(url: str) -> str:
+    return (url or "").strip().lower().rstrip("/")
+
+
+def collect_reference_images(
+    ref_file=None,
+    selected_page_index: Optional[int] = None,
+    pages=None,
+    ref_image_url: Optional[str] = None,
+    additional_ref_urls: Optional[List[str]] = None,
+    saved_labeled: Optional[List[Dict[str, str]]] = None,
+    legacy_canonical_url: Optional[str] = None,
+) -> Tuple[List[bytes], str]:
+    """
+    Build ordered reference image bytes (max MAX_REFERENCE_IMAGES) and matching prompt instructions.
+    Order: file upload → saved labeled URLs → legacy canonical URL → additional URLs → in-session page
+    image → published page URL. De-duplicates by URL.
+    """
+    seen_urls: set = set()
+    refs: List[bytes] = []
+    labels: List[str] = []
+
+    def add_bytes(data: bytes, label: str) -> None:
+        if len(refs) >= MAX_REFERENCE_IMAGES or not data:
+            return
+        refs.append(data)
+        labels.append(label)
+
+    if ref_file is not None:
+        if hasattr(ref_file, "seek"):
+            ref_file.seek(0)
+        data = ref_file.read()
+        if data:
+            add_bytes(data, "Uploaded reference")
+
+    for entry in saved_labeled or []:
+        url = str(entry.get("url") or "").strip()
+        if not url:
+            continue
+        nu = _normalize_ref_url(url)
+        if nu in seen_urls:
+            continue
+        seen_urls.add(nu)
+        try:
+            r = requests.get(url, timeout=15)
+            if r.ok and r.content:
+                add_bytes(r.content, str(entry.get("label") or "").strip() or "Reference")
+        except Exception:
+            pass
+
+    leg = (legacy_canonical_url or "").strip()
+    if leg:
+        nu = _normalize_ref_url(leg)
+        if nu not in seen_urls:
+            seen_urls.add(nu)
+            try:
+                r = requests.get(leg, timeout=15)
+                if r.ok and r.content:
+                    add_bytes(r.content, "Character (canonical)")
+            except Exception:
+                pass
+
+    for u in additional_ref_urls or []:
+        u = str(u or "").strip()
+        if not u:
+            continue
+        nu = _normalize_ref_url(u)
+        if nu in seen_urls:
+            continue
+        seen_urls.add(nu)
+        try:
+            r = requests.get(u, timeout=15)
+            if r.ok and r.content:
+                add_bytes(r.content, "Reference")
+        except Exception:
+            pass
+
+    if selected_page_index is not None and pages and 0 <= selected_page_index < len(pages):
+        p = pages[selected_page_index]
+        img = p.get("image")
+        if img:
+            add_bytes(img, "Page reference")
+
+    pub = (ref_image_url or "").strip()
+    if pub:
+        nu = _normalize_ref_url(pub)
+        if nu not in seen_urls:
+            seen_urls.add(nu)
+            try:
+                r = requests.get(pub, timeout=15)
+                if r.ok and r.content:
+                    add_bytes(r.content, "Published page reference")
+            except Exception:
+                pass
+
+    note = format_visual_reference_instructions(labels)
+    return refs, note
 
 # Flattened story content table (replaces book_pages, localized_story_versions, story_assets)
 TABLE_STORY_CONTENT_FLAT = "story_content_flat"
@@ -40,7 +256,9 @@ PAGE_NUMBER_COLUMN = "page_number"  # Always order by this ascending for correct
 SYSTEM_INSTRUCTIONS = (
     "You are a consistent storybook illustrator. CRITICAL: The main character must have the EXACT SAME face, hair, beard, and clothing in every image. "
     "Use the provided character description as a fixed design—do not vary it. No creative reinterpretation of the character. "
-    "Quality: Standard. Aspect Ratio: 1024x1024. Never include text, words, or letters in the image. "
+    "Quality: Standard. Aspect Ratio: 1024x1024. Never include text, words, or letters in the image.\n\n"
+    + SCENE_HARD_RULES
+    + "\n"
 )
 
 
@@ -53,6 +271,7 @@ def build_prompt(
     lighting: str,
     palette: str,
     framing: str = "",
+    visual_reference_note: str = "",
 ) -> str:
     """Build a structured prompt with explicit sections for all style controls, main text, and extra details."""
     extra = (extra_details or "").strip()
@@ -63,9 +282,12 @@ def build_prompt(
     light = (lighting or "").strip()
     pal = (palette or "").strip()
     frame = (framing or "").strip()
+    vref = (visual_reference_note or "").strip()
 
     sections = []
     sections.append(f"SCENE TO ILLUSTRATE: {story}" if story else "SCENE TO ILLUSTRATE: (illustrate the story moment)")
+    if vref:
+        sections.append(vref)
     if extra:
         sections.append(f"EXTRA VISUAL DETAILS: {extra}")
     if age:
@@ -85,32 +307,125 @@ def build_prompt(
     return f"{SYSTEM_INSTRUCTIONS}{body}"
 
 
+LEONARDO_NEGATIVE_BASE = (
+    "text, words, letters, typography, watermark, signature, logo, blurry, low quality, "
+    "deformed hands, extra fingers, cropped, worst quality, "
+    + LEONARDO_NEGATIVE_IMAGE_HARD_RULES
+    + ", "
+    + LEONARDO_NEGATIVE_KID_SOFT
+)
+
+
+def _leonardo_style_signal_mode(reading_level: Optional[str]) -> str:
+    """Fewer stacked style cues for young grades = less conflict with simple art direction."""
+    r = (reading_level or "").strip().lower()
+    if r in ("grade_1", "grade_2"):
+        return "minimal"
+    if r == "grade_3":
+        return "standard"
+    return "full"
+
+
+def _trim_leonardo_positive(text: str, max_len: int = 1480) -> str:
+    """Stay under Leonardo body limits without hard mid-word API truncation."""
+    t = (text or "").strip()
+    if len(t) <= max_len:
+        return t
+    cut = t[:max_len]
+    if " " in cut:
+        return cut.rsplit(" ", 1)[0].rstrip(",; ")
+    return cut
+
+
+def build_leonardo_prompt(
+    extra_details: str,
+    story_text: str,
+    age_appropriateness: str,
+    global_style: str,
+    character_ref: str,
+    lighting: str,
+    palette: str,
+    framing: str = "",
+    user_negative_suffix: str = "",
+    visual_reference_note: str = "",
+    reading_level: Optional[str] = None,
+) -> Tuple[str, str]:
+    """Build (positive_prompt, negative_prompt) tuned for Leonardo — Gemini-aligned lead, then scene and style."""
+    extra = (extra_details or "").strip()
+    story = (story_text or "").strip()
+    vref = (visual_reference_note or "").strip()
+    mode = _leonardo_style_signal_mode(reading_level)
+
+    parts: List[str] = [LEONARDO_ILLUSTRATOR_LOCK.strip(), LEONARDO_POSITIVE_IMAGE_RULES]
+    if (age_appropriateness or "").strip():
+        parts.append(f"Audience: {(age_appropriateness or '').strip()[:320]}")
+    if story:
+        parts.append(f"Scene: {story[:1200]}")
+    if vref:
+        parts.append(vref[:600])
+    if extra:
+        parts.append(extra[:800])
+    if (character_ref or "").strip():
+        parts.append(f"Characters: {(character_ref or '').strip()[:600]}")
+
+    style_bits: List[str] = []
+    if (global_style or "").strip():
+        style_bits.append((global_style or "").strip()[:400])
+    if (palette or "").strip():
+        style_bits.append(f"Colors: {(palette or '').strip()[:120]}")
+    if mode in ("standard", "full") and (lighting or "").strip():
+        style_bits.append(f"Lighting: {(lighting or '').strip()[:120]}")
+    if mode == "full" and (framing or "").strip():
+        style_bits.append(f"Framing: {(framing or '').strip()[:120]}")
+    if style_bits:
+        parts.append("Style: " + "; ".join(style_bits))
+    if mode == "minimal":
+        parts.append(
+            "Composition: one clear friendly focal subject, gentle non-scary mood, uncluttered background."
+        )
+    parts.append("Children's storybook illustration, cohesive series, no text in image.")
+    positive = _trim_leonardo_positive(" ".join(p for p in parts if p).strip())
+    if not positive:
+        positive = "Storybook illustration, friendly scene, no text in image."
+    neg = LEONARDO_NEGATIVE_BASE
+    if user_negative_suffix and user_negative_suffix.strip():
+        neg = f"{neg}, {user_negative_suffix.strip()}"
+    return positive, neg
+
+
 def get_reference_images(
     ref_file=None,
     selected_page_index: Optional[int] = None,
     pages=None,
     ref_image_url: Optional[str] = None,
+    additional_ref_urls: Optional[List[str]] = None,
+    saved_labeled: Optional[List[Dict[str, str]]] = None,
+    legacy_canonical_url: Optional[str] = None,
 ) -> List[bytes]:
-    """Collect reference images: uploaded file, selected in-session page, or published/uploaded page URL."""
-    refs: List[bytes] = []
-    if ref_file is not None:
-        if hasattr(ref_file, "seek"):
-            ref_file.seek(0)
-        data = ref_file.read()
-        if data:
-            refs.append(data)
-    if selected_page_index is not None and pages and 0 <= selected_page_index < len(pages):
-        p = pages[selected_page_index]
-        if p.get("image"):
-            refs.append(p["image"])
-    if ref_image_url and ref_image_url.strip():
-        try:
-            r = requests.get(ref_image_url, timeout=10)
-            if r.ok and r.content:
-                refs.append(r.content)
-        except Exception:
-            pass
+    """Collect reference image bytes (see collect_reference_images for order and de-duplication)."""
+    refs, _ = collect_reference_images(
+        ref_file=ref_file,
+        selected_page_index=selected_page_index,
+        pages=pages,
+        ref_image_url=ref_image_url,
+        additional_ref_urls=additional_ref_urls,
+        saved_labeled=saved_labeled,
+        legacy_canonical_url=legacy_canonical_url,
+    )
     return refs
+
+
+def reference_entries_from_grade_style(style: Optional[dict]) -> List[Dict[str, str]]:
+    """Labeled URL rows from saved style, migrating legacy character_reference_image_url when list is empty."""
+    if not style:
+        return []
+    entries = parse_reference_images_json(style.get("reference_images"))
+    if entries:
+        return entries[:MAX_REFERENCE_IMAGES]
+    leg = (style.get("character_reference_image_url") or "").strip()
+    if leg:
+        return [{"label": "Character", "url": leg}]
+    return []
 
 
 def get_gemini():
@@ -118,7 +433,7 @@ def get_gemini():
     if st.session_state.gemini_client is None:
         api_key = get_secret("GEMINI_API_KEY")
         if not api_key:
-            st.error("Set GEMINI_API_KEY in .env for Nano Banana Pro.")
+            st.error("Set GEMINI_API_KEY in .env for Gemini image generation.")
             return None
         try:
             from google import genai
@@ -129,12 +444,39 @@ def get_gemini():
     return st.session_state.gemini_client
 
 
+def _gemini_usage_line(response) -> Optional[str]:
+    """Short caption from generate_content usage_metadata, if present."""
+    um = getattr(response, "usage_metadata", None)
+    if um is None:
+        return None
+
+    def _g(obj, snake: str, camel: str):
+        v = getattr(obj, snake, None)
+        if v is not None:
+            return v
+        return getattr(obj, camel, None)
+
+    pt = _g(um, "prompt_token_count", "promptTokenCount")
+    ct = _g(um, "candidates_token_count", "candidatesTokenCount")
+    tt = _g(um, "total_token_count", "totalTokenCount")
+    bits = []
+    if pt is not None:
+        bits.append(f"prompt {pt} tok")
+    if ct is not None:
+        bits.append(f"candidates {ct} tok")
+    if tt is not None:
+        bits.append(f"total {tt} tok")
+    if bits:
+        return "Gemini: " + ", ".join(bits)
+    return None
+
+
 def _prepare_reference_images(reference_images: Optional[List[bytes]]) -> List[Image.Image]:
     """Validate and normalize reference images to RGB PIL Images. Skips any that fail."""
     prepared = []
     if not reference_images:
         return prepared
-    for img_bytes in reference_images[:5]:
+    for img_bytes in reference_images[:MAX_REFERENCE_IMAGES]:
         try:
             img = Image.open(BytesIO(img_bytes))
             if img.mode != "RGB":
@@ -145,8 +487,10 @@ def _prepare_reference_images(reference_images: Optional[List[bytes]]) -> List[I
     return prepared
 
 
-def _generate_image_with_client(client, prompt: str, reference_images: Optional[List[bytes]] = None) -> Tuple[Optional[bytes], Optional[str]]:
-    """Generate image using an existing Gemini client. Returns (image_bytes, error_message)."""
+def _generate_image_with_client(
+    client, prompt: str, reference_images: Optional[List[bytes]] = None
+) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+    """Generate image using an existing Gemini client. Returns (image_bytes, error_message, usage_caption)."""
     try:
         from google.genai import types
         ref_imgs = _prepare_reference_images(reference_images)
@@ -167,24 +511,25 @@ def _generate_image_with_client(client, prompt: str, reference_images: Optional[
                     reason = f"Blocked: {pf.block_reason}"
                 if getattr(pf, "block_reason_message", None):
                     reason = f"{reason} — {pf.block_reason_message}"
-            return (None, reason)
+            return (None, reason, None)
         candidate = response.candidates[0]
         finish_reason = getattr(candidate, "finish_reason", None)
         if finish_reason is not None:
             fr = getattr(finish_reason, "name", str(finish_reason)).upper()
             if fr not in ("STOP", "END_TURN", "1", ""):
-                return (None, f"Response finish reason: {finish_reason}")
+                return (None, f"Response finish reason: {finish_reason}", None)
+        usage = _gemini_usage_line(response)
         parts = candidate.content.parts
         for part in parts:
             if hasattr(part, "inline_data") and part.inline_data is not None:
                 data = getattr(part.inline_data, "data", None)
                 if data is not None:
                     if isinstance(data, bytes):
-                        return (data, None)
+                        return (data, None, usage)
                     try:
-                        return (base64.b64decode(data), None)
+                        return (base64.b64decode(data), None, usage)
                     except Exception:
-                        return (data if isinstance(data, bytes) else bytes(data), None)
+                        return (data if isinstance(data, bytes) else bytes(data), None, usage)
             img = getattr(part, "as_image", lambda: None)()
             if img is not None:
                 buf = BytesIO()
@@ -192,25 +537,30 @@ def _generate_image_with_client(client, prompt: str, reference_images: Optional[
                     img.save(buf, "PNG")
                 except TypeError:
                     img.save(buf)
-                return (buf.getvalue(), None)
-        return (None, "No image in response")
+                return (buf.getvalue(), None, usage)
+        return (None, "No image in response", usage)
     except Exception as e:
-        return (None, str(e))
+        return (None, str(e), None)
 
 
 _GEMINI_MAX_RETRIES = 2
 
 
-def generate_image_gemini(prompt: str, reference_images: Optional[List[bytes]] = None) -> Optional[bytes]:
-    """Generate image via Nano Banana Pro (Gemini 3 Pro Image). Retries on transient errors."""
+def generate_image_gemini(prompt: str, reference_images: Optional[List[bytes]] = None) -> Tuple[Optional[bytes], Optional[str]]:
+    """Generate image via Gemini (gemini-3-pro-image-preview). Retries on transient errors.
+
+    Returns (image_bytes, usage_caption). usage_caption is set on success when the API returns usage metadata.
+    """
     client = get_gemini()
     if not client:
-        return None
+        return None, None
     last_error = None
+    last_usage: Optional[str] = None
     for attempt in range(_GEMINI_MAX_RETRIES):
-        result, error = _generate_image_with_client(client, prompt, reference_images)
+        result, error, usage = _generate_image_with_client(client, prompt, reference_images)
         if result is not None:
-            return result
+            return result, usage
+        last_usage = usage
         last_error = error or "Unknown error"
         if attempt < _GEMINI_MAX_RETRIES - 1:
             if any(code in last_error for code in ("400", "500", "503", "UNAVAILABLE")):
@@ -220,16 +570,79 @@ def generate_image_gemini(prompt: str, reference_images: Optional[List[bytes]] =
         break
     ref_count = len(reference_images) if reference_images else 0
     diag = f"Prompt length: {len(prompt)} chars, reference images: {ref_count}"
-    st.error(f"Nano Banana Pro generation failed: {last_error}")
+    st.error(f"Gemini image generation failed: {last_error}")
     st.caption(f"Debug: {diag}")
-    return None
+    return None, last_usage
+
+
+def generate_image_leonardo(
+    positive: str,
+    negative: str,
+    reference_images: Optional[List[bytes]] = None,
+    *,
+    api_key: str,
+    model_id: str,
+    width: Optional[int] = None,
+    height: Optional[int] = None,
+    guidance_scale: float = 6.0,
+    seed: Optional[int] = None,
+    controlnet_strength: str = "Low",
+    preprocessor_id: Optional[int] = None,
+    contrast: Optional[float] = None,
+) -> Tuple[Optional[bytes], Optional[str]]:
+    """Generate one image via Leonardo; poll until complete. Uses Character Reference on the first ref image only.
+
+    Returns (image_bytes, cost_caption). cost_caption comes from the generation record when available.
+    """
+    import leonardo_client as leo
+
+    if not api_key or not model_id:
+        st.error("Set LEONARDO_API_KEY and LEONARDO_MODEL_ID.")
+        return None, None
+    controlnets = None
+    try:
+        if reference_images:
+            controlnets = []
+            for chunk in reference_images[:LEONARDO_MAX_CHARACTER_REFERENCE_REFS]:
+                init_id = leo.upload_init_image_bytes(api_key, chunk)
+                controlnets.extend(
+                    leo.character_reference_controlnets(
+                        init_id,
+                        model_id=model_id,
+                        strength_type=controlnet_strength,
+                        preprocessor_id=preprocessor_id,
+                    )
+                )
+        gen_id = leo.create_generation(
+            api_key,
+            positive[:1500],
+            model_id,
+            negative_prompt=negative[:1000],
+            width=width,
+            height=height,
+            num_images=1,
+            guidance_scale=guidance_scale,
+            seed=seed,
+            preset_style="ILLUSTRATION",
+            alchemy=True,
+            controlnets=controlnets,
+            contrast=contrast,
+        )
+        img, err, cost_line = leo.poll_generation_until_done(api_key, gen_id, interval_sec=2.0, max_wait_sec=360.0)
+        if img is not None:
+            return img, cost_line
+        st.error(f"Leonardo generation failed: {err or 'unknown'}")
+        return None, None
+    except Exception as e:
+        st.error(f"Leonardo error: {e}")
+        return None, None
 
 
 def _build_batch_request_parts(prompt: str, ref_images: Optional[List[bytes]] = None) -> list:
     """Build contents parts for a Batch API request: text + optional base64 ref images."""
     parts = [{"text": prompt}]
     if ref_images:
-        for img_bytes in ref_images[:5]:
+        for img_bytes in ref_images[:MAX_REFERENCE_IMAGES]:
             b64 = base64.b64encode(img_bytes).decode("utf-8")
             parts.append({"inline_data": {"mime_type": "image/png", "data": b64}})
     return parts
@@ -328,6 +741,10 @@ STORY_STYLE_COLUMNS = [
     "lighting",
     "framing",
     "reference_page_index",
+    "reference_images",
+    "character_reference_image_url",
+    "leonardo_seed",
+    "default_image_provider",
 ]
 
 
@@ -358,6 +775,16 @@ def upsert_story_grade_style(supabase, story_id: int, reading_level: str, data: 
                 continue
             if k == "reference_page_index":
                 row[k] = data[k]  # int or None
+            elif k == "leonardo_seed":
+                row[k] = data[k]  # int or None
+            elif k == "reference_images":
+                v = data[k]
+                if v is None:
+                    row[k] = []
+                elif isinstance(v, str):
+                    row[k] = json.loads(v) if v.strip() else []
+                else:
+                    row[k] = list(v)
             else:
                 row[k] = data[k] if data[k] is not None else ""
         supabase.table("story_grade_styles").upsert(row, on_conflict="story_id,reading_level").execute()
@@ -649,6 +1076,17 @@ def upload_image_to_storage(supabase, story_id: int, reading_level: str, page_in
     return upload_image(path, image_bytes)
 
 
+def upload_reference_image_to_storage(
+    supabase, story_id: int, reading_level: str, slot_index: int, image_bytes: bytes
+) -> Optional[str]:
+    """Upload a style reference image to R2 under refs/. Returns public URL or None."""
+    from storage_r2 import upload_image
+
+    opt = optimize_image_for_mobile(image_bytes)
+    path = f"{story_id}/{reading_level}/refs/ref_{int(slot_index)}.webp"
+    return upload_image(path, opt)
+
+
 def upload_audio_to_storage(
     supabase, story_id: int, language_code: str, reading_level: str, page_index: int, audio_bytes: bytes, voice: str
 ) -> Optional[str]:
@@ -880,6 +1318,83 @@ def update_batch_job_status(
         return False
 
 
+# ---------------------------------------------------------------------------
+# Per-page image jobs (Leonardo async queue)
+# ---------------------------------------------------------------------------
+
+TABLE_IMAGE_GENERATION_JOBS = "image_generation_jobs"
+
+
+def insert_image_generation_job(
+    supabase,
+    story_id: int,
+    reading_level: str,
+    story_content_flat_id: str,
+    external_generation_id: str,
+    provider: str = "leonardo",
+) -> Optional[str]:
+    """Insert a pending job row. Returns job UUID string or None."""
+    try:
+        r = (
+            supabase.table(TABLE_IMAGE_GENERATION_JOBS)
+            .insert({
+                "story_id": story_id,
+                "reading_level": reading_level,
+                "story_content_flat_id": str(story_content_flat_id),
+                "provider": provider,
+                "external_generation_id": external_generation_id,
+                "status": "pending",
+            })
+            .execute()
+        )
+        rows = r.data or []
+        return str(rows[0]["id"]) if rows else None
+    except Exception as e:
+        st.error(f"Failed to insert image generation job: {e}")
+        return None
+
+
+def fetch_pending_image_generation_jobs(
+    supabase, story_id: int, reading_level: str
+) -> List[dict]:
+    try:
+        r = (
+            supabase.table(TABLE_IMAGE_GENERATION_JOBS)
+            .select("*")
+            .eq("story_id", story_id)
+            .eq("reading_level", reading_level)
+            .eq("status", "pending")
+            .order("created_at")
+            .execute()
+        )
+        return r.data or []
+    except Exception as e:
+        st.error(f"Failed to fetch image generation jobs: {e}")
+        return []
+
+
+def update_image_generation_job(
+    supabase,
+    job_id: str,
+    status: str,
+    error_message: Optional[str] = None,
+) -> bool:
+    try:
+        from datetime import datetime, timezone
+
+        updates = {
+            "status": status,
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if error_message is not None:
+            updates["error_message"] = error_message
+        supabase.table(TABLE_IMAGE_GENERATION_JOBS).update(updates).eq("id", job_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"Failed to update image generation job: {e}")
+        return False
+
+
 def generate_elevenlabs_audio(
     api_key: str,
     voice_id: str,
@@ -1019,10 +1534,15 @@ def replace_image_modal(row: dict, story_id: int, reading_level: str):
                 st.rerun()
 
 
-def run_audio_generator_view():
+def run_audio_generator_view(*, as_wizard_step: bool = False):
     """Audio Generator: batch create male/female audio via ElevenLabs for pages missing audio."""
-    st.title("Audio Generator")
-    st.caption("Generate male and female voice audio for pages missing audio. Uses ElevenLabs with timestamps.")
+    if as_wizard_step:
+        st.caption(
+            "Generate male and female voice audio for pages missing audio. Uses ElevenLabs with timestamps."
+        )
+    else:
+        st.title("Audio Generator")
+        st.caption("Generate male and female voice audio for pages missing audio. Uses ElevenLabs with timestamps.")
 
     sb = get_supabase()
     if not sb:
@@ -1049,7 +1569,7 @@ def run_audio_generator_view():
     if story_id:
         versions = fetch_localized_versions(sb, story_id)
 
-    lang_options = sorted({v.get("language_code") for v in versions if v.get("language_code")}) or LANGUAGE_CODES
+    lang_options = ui_language_select_options(versions)
     with col2:
         ag_language = st.selectbox("Language", options=lang_options, key="ag_language")
 
@@ -1067,88 +1587,26 @@ def run_audio_generator_view():
     else:
         ag_grade = None
 
-    # ElevenLabs settings: per level when "All levels", single set when "Single level"
+    # ElevenLabs: multilingual model, fixed Johnny Kid + Zara, per-grade speed (not editable in UI).
     stability_default = 0.5
     similarity_boost_default = 0.75
     use_speaker_boost = False
-    model_id = "eleven_flash_v2_5"
-    output_format = "mp3_22050_32"
-    optimize_streaming_latency = 1
+    model_id = ELEVENLABS_TTS_MODEL_ID
+    output_format = ELEVENLABS_TTS_OUTPUT_FORMAT
+    optimize_streaming_latency = 0
     apply_text_normalization = "auto"
 
-    def _get_ag_settings_for_level(lev):
-        """Return speed, voice_male, voice_female for a level (from session state or defaults)."""
-        if ag_all_levels_mode:
-            male_idx = int(st.session_state.get(f"ag_voice_male_{lev}", 0))
-            female_idx = int(st.session_state.get(f"ag_voice_female_{lev}", 0))
-            return {
-                "speed": float(st.session_state.get(f"ag_speed_{lev}", 1.0)),
-                "voice_male": VOICES_MALE[male_idx][1],
-                "voice_female": VOICES_FEMALE[female_idx][1],
-            }
-        else:
-            male_idx = int(st.session_state.get("ag_voice_male", 0))
-            female_idx = int(st.session_state.get("ag_voice_female", 0))
-            return {
-                "speed": float(st.session_state.get("ag_speed", 1.0)),
-                "voice_male": VOICES_MALE[male_idx][1],
-                "voice_female": VOICES_FEMALE[female_idx][1],
-            }
+    def _get_ag_settings_for_level(lev: str) -> dict:
+        return {
+            "speed": audio_tts_speed_for_grade(lev),
+            "voice_male": ELEVENLABS_VOICE_MALE_DEFAULT,
+            "voice_female": ELEVENLABS_VOICE_FEMALE_DEFAULT,
+        }
 
-    if ag_all_levels_mode:
-        st.caption("Set speed and voices separately for each level. These are used when you generate audio for that level.")
-        for lev in READING_LEVELS:
-            with st.expander(f"Audio settings: {lev.replace('_', ' ').title()}", expanded=False):
-                st.slider(
-                    "Speed (0.7 = slower, 1.2 = faster)",
-                    min_value=0.7,
-                    max_value=1.2,
-                    value=float(st.session_state.get(f"ag_speed_{lev}", 1.0)),
-                    step=0.05,
-                    key=f"ag_speed_{lev}",
-                )
-                st.selectbox(
-                    "Male voice",
-                    options=range(len(VOICES_MALE)),
-                    format_func=lambda i: f"{VOICES_MALE[i][0]} — {VOICES_MALE[i][2]}",
-                    key=f"ag_voice_male_{lev}",
-                )
-                st.selectbox(
-                    "Female voice",
-                    options=range(len(VOICES_FEMALE)),
-                    format_func=lambda i: f"{VOICES_FEMALE[i][0]} — {VOICES_FEMALE[i][2]}",
-                    key=f"ag_voice_female_{lev}",
-                )
-        st.caption("Model: eleven_flash_v2_5 · Output: mp3_22050_32 · Stability: 0.5 · Similarity: 0.75 · Latency: Normal")
-    else:
-        v1, v2 = st.columns(2)
-        with v1:
-            male_opt = st.selectbox(
-                "Male voice",
-                options=range(len(VOICES_MALE)),
-                format_func=lambda i: f"{VOICES_MALE[i][0]} — {VOICES_MALE[i][2]}",
-                key="ag_voice_male",
-            )
-            voice_male = VOICES_MALE[male_opt][1]
-        with v2:
-            female_opt = st.selectbox(
-                "Female voice",
-                options=range(len(VOICES_FEMALE)),
-                format_func=lambda i: f"{VOICES_FEMALE[i][0]} — {VOICES_FEMALE[i][2]}",
-                key="ag_voice_female",
-            )
-            voice_female = VOICES_FEMALE[female_opt][1]
-        with st.expander("ElevenLabs audio settings", expanded=False):
-            st.caption("Optimized for mobile: lightweight model, small files, balanced quality.")
-            st.slider(
-                "Speed (0.7 = slower, 1.2 = faster)",
-                min_value=0.7,
-                max_value=1.2,
-                value=1.0,
-                step=0.05,
-                key="ag_speed",
-            )
-            st.caption("Model: eleven_flash_v2_5 · Output: mp3_22050_32 · Stability: 0.5 · Similarity: 0.75 · Latency: Normal")
+    st.caption(
+        f"Narrators: **Johnny Kid** (male), **Zara** (female) · Model `{model_id}` · {output_format} · "
+        "Speed by grade: 1 → 0.75, 2–4 → 0.8, 5 → 0.9"
+    )
 
     language_code = ag_language
     story_id_ver = story_id
@@ -1187,7 +1645,7 @@ def run_audio_generator_view():
         reading_level_ver = version.get("reading_level", ag_grade)
         pages_missing = fetch_pages_missing_audio(sb, story_id_ver, language_code, reading_level_ver)
 
-    # Show which rows need audio (story + language + grade), like translator’s “Found X English pages”
+    if not ag_all_levels_mode:
         if pages_missing:
             st.success(
                 f"**{len(pages_missing)}** pages missing audio for **Story {story_id_ver}**, "
@@ -1210,65 +1668,7 @@ def run_audio_generator_view():
     stability = stability_default
     similarity_boost = similarity_boost_default
 
-    st.subheader("1. Preview first page")
-    st.caption("Generate male and/or female audio for the first page. Listen and adjust settings before running the full batch.")
-    if ag_all_levels_mode:
-        preview_level = st.selectbox(
-            "Preview using settings for",
-            options=READING_LEVELS,
-            key="ag_preview_settings_level",
-            format_func=lambda x: x.replace("_", " ").title(),
-        )
-        first = (levels_missing.get(preview_level) or [None])[0] if levels_missing else None
-    else:
-        first = pages_missing[0] if pages_missing else None
-    page_text = _get_page_text(first) if first else ""
-    if ag_all_levels_mode:
-        preview_settings = _get_ag_settings_for_level(preview_level)
-        preview_voice_male = preview_settings["voice_male"]
-        preview_voice_female = preview_settings["voice_female"]
-        preview_speed = preview_settings["speed"]
-    else:
-        preview_voice_male = voice_male
-        preview_voice_female = voice_female
-        preview_speed = float(st.session_state.get("ag_speed", 1.0))
-    pre1, pre2 = st.columns(2)
-    with pre1:
-        if st.button("Preview male voice", key="ag_preview_male"):
-            if first and page_text:
-                with st.spinner("Generating male preview..."):
-                    male_bytes, _ = generate_elevenlabs_audio(
-                        api_key, preview_voice_male, page_text, language_code,
-                        stability=stability, similarity_boost=similarity_boost,
-                        use_speaker_boost=use_speaker_boost, speed=preview_speed,
-                        model_id=model_id, output_format=output_format,
-                        optimize_streaming_latency=optimize_streaming_latency,
-                        apply_text_normalization=apply_text_normalization,
-                    )
-                st.session_state["ag_preview_male_bytes"] = male_bytes
-        if st.session_state.get("ag_preview_male_bytes"):
-            st.audio(st.session_state["ag_preview_male_bytes"], format="audio/mp3")
-            male_idx = int(st.session_state.get(f"ag_voice_male_{preview_level}", 0)) if ag_all_levels_mode else male_opt
-            st.caption(f"Male ({VOICES_MALE[male_idx][0]})")
-    with pre2:
-        if st.button("Preview female voice", key="ag_preview_female"):
-            if first and page_text:
-                with st.spinner("Generating female preview..."):
-                    female_bytes, _ = generate_elevenlabs_audio(
-                        api_key, preview_voice_female, page_text, language_code,
-                        stability=stability, similarity_boost=similarity_boost,
-                        use_speaker_boost=use_speaker_boost, speed=preview_speed,
-                        model_id=model_id, output_format=output_format,
-                        optimize_streaming_latency=optimize_streaming_latency,
-                        apply_text_normalization=apply_text_normalization,
-                    )
-                st.session_state["ag_preview_female_bytes"] = female_bytes
-        if st.session_state.get("ag_preview_female_bytes"):
-            st.audio(st.session_state["ag_preview_female_bytes"], format="audio/mp3")
-            female_idx = int(st.session_state.get(f"ag_voice_female_{preview_level}", 0)) if ag_all_levels_mode else female_opt
-            st.caption(f"Female ({VOICES_FEMALE[female_idx][0]})")
-
-    st.subheader("2. Generate all")
+    st.subheader("Generate")
     levels_missing_agg = levels_missing if ag_all_levels_mode else {}
     total_pages_display = (sum(len(p) for p in levels_missing_agg.values()) if ag_all_levels_mode else len(pages_missing))
     st.write(f"**{total_pages_display}** pages missing male and/or female audio.")
@@ -1333,7 +1733,8 @@ def run_audio_generator_view():
             st.info("No pages missing audio.")
         else:
             prog = st.progress(0)
-            speed = float(st.session_state.get("ag_speed", 1.0))
+            rl = reading_level_ver or ""
+            speed = audio_tts_speed_for_grade(rl)
             batch = {
                 "story_id": story_id_ver,
                 "language_code": language_code,
@@ -1354,7 +1755,7 @@ def run_audio_generator_view():
                 if page_text:
                     if not _row_has_male_audio(page):
                         audio_bytes, timing = generate_elevenlabs_audio(
-                            api_key, voice_male, page_text, language_code,
+                            api_key, ELEVENLABS_VOICE_MALE_DEFAULT, page_text, language_code,
                             stability=stability, similarity_boost=similarity_boost,
                             use_speaker_boost=use_speaker_boost, speed=speed,
                             model_id=model_id, output_format=output_format,
@@ -1368,7 +1769,7 @@ def run_audio_generator_view():
 
                     if not _row_has_female_audio(page):
                         audio_bytes, timing = generate_elevenlabs_audio(
-                            api_key, voice_female, page_text, language_code,
+                            api_key, ELEVENLABS_VOICE_FEMALE_DEFAULT, page_text, language_code,
                             stability=stability, similarity_boost=similarity_boost,
                             use_speaker_boost=use_speaker_boost, speed=speed,
                             model_id=model_id, output_format=output_format,
@@ -1404,7 +1805,7 @@ def run_audio_generator_view():
                 del st.session_state["ag_generated_batch"]
             batch = None
     if batches_list:
-        st.subheader("3. Preview generated batch (all levels)")
+        st.subheader("Review generated batch (all levels)")
         st.caption("Listen by level. When ready, click Approve and save to Supabase to save all levels.")
         ag_preview_level = st.selectbox(
             "Preview level",
@@ -1453,7 +1854,7 @@ def run_audio_generator_view():
             st.success(f"Saved {ok} audio URLs to story_content_flat (all levels).")
             st.rerun()
     elif batch and batch.get("pages"):
-        st.subheader("3. Preview generated batch")
+        st.subheader("Review generated batch")
         st.caption("Listen to the generated audio. When ready, click Approve and save to Supabase.")
         for entry in batch["pages"]:
             st.write(f"**Page {entry['page_index']}:** {entry.get('page_text', '')}...")
@@ -1540,8 +1941,8 @@ def run_audio_generator_view():
 
 
 def run_book_pages_view():
-    """Render Book Pages: page selector + focus panel with edit text, regenerate image/audio, upload, delete."""
-    st.title("Book Pages")
+    """Render Story Content Manager: page selector + focus panel with edit text, regenerate image/audio, upload, delete."""
+    st.title("Story Content Manager")
     st.caption("View, search, filter, sort, and manage each page (edit text, regenerate or upload image/audio, delete).")
     sb = get_supabase()
     if not sb:
@@ -1558,7 +1959,7 @@ def run_book_pages_view():
         story_label = st.selectbox("Story", options=list(story_options.keys()), key="bp_story")
         story_id = story_options.get(story_label) if story_label else None
     versions = fetch_localized_versions(sb, story_id) if story_id else []
-    bp_lang_options = sorted({v.get("language_code") for v in versions if v.get("language_code")}) or LANGUAGE_CODES
+    bp_lang_options = ui_language_select_options(versions)
     with top2:
         language_code = st.selectbox("Language", options=bp_lang_options, key="bp_language")
     with top3:
@@ -1755,14 +2156,19 @@ def run_book_pages_view():
                     cp = (style.get("color_palette") or "").strip()
                     fr = (style.get("framing") or "").strip()
                     text_for_prompt = (st.session_state.get(f"bp_text_{row_id}", new_text) or "").strip() or page_text
+                    labeled = reference_entries_from_grade_style(style)
+                    refs, ref_note = collect_reference_images(
+                        ref_image_url=selected_ref_url,
+                        saved_labeled=labeled if labeled else None,
+                    )
                     prompt = build_prompt(
                         (correction or "").strip(),
                         text_for_prompt,
                         ap, sp, cr, li, cp, fr,
+                        visual_reference_note=ref_note,
                     )
-                    refs = get_reference_images(ref_image_url=selected_ref_url)
                     with st.spinner("Generating image..."):
-                        img = generate_image_gemini(prompt, refs if refs else None)
+                        img, _usage = generate_image_gemini(prompt, refs if refs else None)
                     if img:
                         opt = optimize_image_for_mobile(img)
                         url_new = upload_image_to_storage(sb, story_id, reading_level, page_idx, opt)
@@ -1805,6 +2211,10 @@ def run_book_pages_view():
                             audio_bytes, timing = generate_elevenlabs_audio(
                                 api_key, voice_id, text_for_audio, language_code,
                                 stability=0.5, similarity_boost=0.75, speed=bp_speed,
+                                model_id=ELEVENLABS_TTS_MODEL_ID,
+                                output_format=ELEVENLABS_TTS_OUTPUT_FORMAT,
+                                optimize_streaming_latency=0,
+                                apply_text_normalization="auto",
                             )
                         if audio_bytes:
                             url_audio = upload_audio_to_stories_path(sb, story_id, language_code, reading_level, "male", page_idx, audio_bytes)
@@ -1842,6 +2252,10 @@ def run_book_pages_view():
                             audio_bytes, timing = generate_elevenlabs_audio(
                                 api_key, voice_id, text_for_audio, language_code,
                                 stability=0.5, similarity_boost=0.75, speed=bp_speed,
+                                model_id=ELEVENLABS_TTS_MODEL_ID,
+                                output_format=ELEVENLABS_TTS_OUTPUT_FORMAT,
+                                optimize_streaming_latency=0,
+                                apply_text_normalization="auto",
                             )
                         if audio_bytes:
                             url_audio = upload_audio_to_stories_path(sb, story_id, language_code, reading_level, "female", page_idx, audio_bytes)
