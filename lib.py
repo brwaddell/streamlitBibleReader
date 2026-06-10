@@ -2054,6 +2054,26 @@ def run_book_pages_view():
         page_options.append(label)
         page_map[label] = r
 
+    current_label = st.session_state.get("bp_page_sel")
+    if current_label not in page_options:
+        current_idx = 0
+        if page_options:
+            st.session_state["bp_page_sel"] = page_options[0]
+    else:
+        current_idx = page_options.index(current_label)
+
+    nav_prev, nav_pos, nav_next = st.columns([1, 4, 1])
+    with nav_prev:
+        if st.button("← Previous", key="bp_page_prev", disabled=current_idx <= 0):
+            st.session_state["bp_page_sel"] = page_options[current_idx - 1]
+            st.rerun()
+    with nav_pos:
+        st.caption(f"Page {current_idx + 1} of {len(page_options)}")
+    with nav_next:
+        if st.button("Next →", key="bp_page_next", disabled=current_idx >= len(page_options) - 1):
+            st.session_state["bp_page_sel"] = page_options[current_idx + 1]
+            st.rerun()
+
     selected_label = st.selectbox("Select a page", options=page_options, key="bp_page_sel")
     selected_row = page_map.get(selected_label) if selected_label else None
 
