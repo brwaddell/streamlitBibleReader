@@ -20,6 +20,8 @@ from scene_prompts import (
 )
 
 READING_LEVELS = ["grade_1", "grade_2", "grade_3", "grade_4", "grade_5"]
+IMAGE_PROCESSOR_GRADES = ("grade_1", "grade_2", "grade_3", "grade_4")
+PAGES_PER_IMAGE = 3
 # Languages offered in Story Text / Audio / Book Pages dropdowns (English + Spanish only).
 LANGUAGE_CODES = ["en", "es"]
 
@@ -96,6 +98,110 @@ def parse_reference_images_json(raw: Any) -> List[Dict[str, str]]:
         lab = str(item.get("label") or "").strip() or "Reference"
         out.append({"label": lab, "url": url})
     return out[:MAX_REFERENCE_IMAGES]
+
+
+def parse_storybook_references(raw: Any) -> Dict[str, Any]:
+    """Normalize storybook_references JSON from story_grade_styles."""
+    empty: Dict[str, Any] = {"style": None, "characters": [], "locations": []}
+    if raw is None:
+        return dict(empty)
+    if isinstance(raw, str):
+        raw = raw.strip()
+        if not raw:
+            return dict(empty)
+        try:
+            raw = json.loads(raw)
+        except json.JSONDecodeError:
+            return dict(empty)
+    if not isinstance(raw, dict):
+        return dict(empty)
+    style = raw.get("style")
+    if style is not None and not isinstance(style, dict):
+        style = None
+    chars = raw.get("characters") if isinstance(raw.get("characters"), list) else []
+    locs = raw.get("locations") if isinstance(raw.get("locations"), list) else []
+    return {
+        "style": style,
+        "characters": [c for c in chars if isinstance(c, dict)],
+        "locations": [loc for loc in locs if isinstance(loc, dict)],
+    }
+
+
+def _saved_ref_entry(entry: Optional[dict]) -> bool:
+    """Approved reference with a stored URL — enough to show in the UI."""
+    if not entry or not isinstance(entry, dict):
+        return False
+    if not entry.get("approved"):
+        return False
+    return bool((entry.get("url") or "").strip())
+
+
+def _approved_ref_entry(entry: Optional[dict]) -> bool:
+    """Approved reference usable for Leonardo generation (needs init image id)."""
+    if not _saved_ref_entry(entry):
+        return False
+    return bool((entry.get("leonardo_init_image_id") or "").strip())
+
+
+def get_saved_style_ref(refs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    style = refs.get("style")
+    return style if _saved_ref_entry(style) else None
+
+
+def get_saved_character_refs(refs: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [c for c in (refs.get("characters") or []) if _saved_ref_entry(c)]
+
+
+def get_saved_location_refs(refs: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [loc for loc in (refs.get("locations") or []) if _saved_ref_entry(loc)]
+
+
+def get_approved_style_ref(refs: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    style = refs.get("style")
+    return style if _approved_ref_entry(style) else None
+
+
+def get_approved_character_refs(refs: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [c for c in (refs.get("characters") or []) if _approved_ref_entry(c)]
+
+
+def get_approved_location_refs(refs: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [loc for loc in (refs.get("locations") or []) if _approved_ref_entry(loc)]
+
+
+def find_character_ref_by_id(refs: Dict[str, Any], ref_id: str) -> Optional[Dict[str, Any]]:
+    rid = (ref_id or "").strip()
+    if not rid:
+        return None
+    for entry in get_approved_character_refs(refs):
+        if entry.get("id") == rid:
+            return entry
+    return None
+
+
+def find_location_ref_by_id(refs: Dict[str, Any], ref_id: str) -> Optional[Dict[str, Any]]:
+    rid = (ref_id or "").strip()
+    if not rid:
+        return None
+    for entry in get_approved_location_refs(refs):
+        if entry.get("id") == rid:
+            return entry
+    return None
+
+
+def storybook_references_from_grade_style(style: Optional[dict]) -> Dict[str, Any]:
+    if not style:
+        return parse_storybook_references(None)
+    return parse_storybook_references(style.get("storybook_references"))
+
+
+def save_storybook_references(
+    supabase, story_id: int, reading_level: str, refs: Dict[str, Any]
+) -> bool:
+    existing = get_story_grade_style(supabase, story_id, reading_level) or {}
+    data = {k: existing[k] for k in STORY_STYLE_COLUMNS if k in existing}
+    data["storybook_references"] = refs
+    return upsert_story_grade_style(supabase, story_id, reading_level, data)
 
 
 def seed_reference_text_slots(
@@ -393,6 +499,75 @@ def build_leonardo_prompt(
     return positive, neg
 
 
+def build_simple_leonardo_prompt(
+    scene_description: str,
+    reading_level: Optional[str] = None,
+    *,
+    character_ref: Optional[Dict[str, Any]] = None,
+    location_ref: Optional[Dict[str, Any]] = None,
+) -> Tuple[str, str]:
+    """Grade-aware storybook prompt for scene generation (Image Processor)."""
+    from grade_style_defaults import grade_style_defaults_for
+    from leonardo_series_config import LEONARDO_GENERATION_DEFAULTS
+    from scene_prompts import LEONARDO_ILLUSTRATOR_LOCK, LEONARDO_POSITIVE_IMAGE_RULES
+
+    g = grade_style_defaults_for(reading_level or "grade_1")
+    scene = (scene_description or "").strip()
+    parts = [
+        LEONARDO_ILLUSTRATOR_LOCK.strip(),
+        LEONARDO_POSITIVE_IMAGE_RULES,
+        f"SCENE (primary — composition and action must follow this): {scene}",
+    ]
+    if character_ref:
+        label = (character_ref.get("label") or "the character").strip()
+        parts.append(
+            f"Character reference: match {label}'s face, hair, and clothing only; "
+            f"pose, action, and scene staging follow the SCENE description."
+        )
+    if location_ref:
+        label = (location_ref.get("label") or "the location").strip()
+        parts.append(
+            f"Location reference: borrow background architecture and mood from {label} only; "
+            f"do not copy the empty reference composition; characters and action follow the SCENE."
+        )
+    age = (g.get("age_appropriateness") or "").strip()
+    if age:
+        parts.append(f"Audience: {age}")
+    palette = (g.get("color_palette") or "").strip()
+    if palette:
+        parts.append(f"Colors: {palette}")
+    lighting = (g.get("lighting") or "").strip()
+    if lighting:
+        parts.append(f"Lighting: {lighting}")
+    framing = (g.get("framing") or "").strip()
+    if framing:
+        parts.append(f"Framing: {framing}")
+    parts.append("Children's storybook illustration, cohesive series, no text in image.")
+    positive = _trim_leonardo_positive("\n".join(p for p in parts if p))
+    negative = LEONARDO_GENERATION_DEFAULTS["negative_prompt"]
+    return positive, negative
+
+
+def build_leonardo_reference_prompt(
+    description: str, reading_level: Optional[str] = None
+) -> Tuple[str, str]:
+    """Prompt for generating a reference image (style / character / location), not a story scene."""
+    from grade_style_defaults import grade_style_defaults_for
+    from leonardo_series_config import LEONARDO_GENERATION_DEFAULTS
+
+    g = grade_style_defaults_for(reading_level or "grade_1")
+    desc = (description or "").strip()
+    parts = [
+        "A children's storybook illustration reference image.",
+        desc,
+        (g.get("age_appropriateness") or "").strip(),
+        "Iconic, reusable visual design, clean composition, no text in image.",
+    ]
+    positive = _trim_leonardo_positive("\n".join(p for p in parts if p))
+    negative = LEONARDO_GENERATION_DEFAULTS["negative_prompt"]
+    return positive, negative
+
+
 def get_reference_images(
     ref_file=None,
     selected_page_index: Optional[int] = None,
@@ -589,23 +764,27 @@ def generate_image_leonardo(
     controlnet_strength: str = "Low",
     preprocessor_id: Optional[int] = None,
     contrast: Optional[float] = None,
+    controlnets: Optional[List[Dict[str, Any]]] = None,
+    preset_style: str = "ILLUSTRATION",
+    alchemy: bool = True,
 ) -> Tuple[Optional[bytes], Optional[str]]:
-    """Generate one image via Leonardo; poll until complete. Uses Character Reference on the first ref image only.
+    """Generate one image via Leonardo; poll until complete.
 
-    Returns (image_bytes, cost_caption). cost_caption comes from the generation record when available.
+    Pass pre-built controlnets for the storybook flow, or reference_images for legacy single character ref.
+    Returns (image_bytes, cost_caption).
     """
     import leonardo_client as leo
 
     if not api_key or not model_id:
         st.error("Set LEONARDO_API_KEY and LEONARDO_MODEL_ID.")
         return None, None
-    controlnets = None
+    cn = controlnets
     try:
-        if reference_images:
-            controlnets = []
+        if cn is None and reference_images:
+            cn = []
             for chunk in reference_images[:LEONARDO_MAX_CHARACTER_REFERENCE_REFS]:
                 init_id = leo.upload_init_image_bytes(api_key, chunk)
-                controlnets.extend(
+                cn.extend(
                     leo.character_reference_controlnets(
                         init_id,
                         model_id=model_id,
@@ -623,12 +802,14 @@ def generate_image_leonardo(
             num_images=1,
             guidance_scale=guidance_scale,
             seed=seed,
-            preset_style="ILLUSTRATION",
-            alchemy=True,
-            controlnets=controlnets,
+            preset_style=preset_style,
+            alchemy=alchemy,
+            controlnets=cn,
             contrast=contrast,
         )
-        img, err, cost_line = leo.poll_generation_until_done(api_key, gen_id, interval_sec=2.0, max_wait_sec=360.0)
+        img, err, cost_line, _gen_img_id = leo.poll_generation_until_done(
+            api_key, gen_id, interval_sec=2.0, max_wait_sec=360.0
+        )
         if img is not None:
             return img, cost_line
         st.error(f"Leonardo generation failed: {err or 'unknown'}")
@@ -636,6 +817,53 @@ def generate_image_leonardo(
     except Exception as e:
         st.error(f"Leonardo error: {e}")
         return None, None
+
+
+def generate_leonardo_reference_preview(
+    prompt: str,
+    *,
+    api_key: str,
+    model_id: str,
+    reading_level: Optional[str] = None,
+    controlnets: Optional[List[Dict[str, Any]]] = None,
+) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+    """Generate a reference image. Returns (bytes, cost_caption, generated_image_id)."""
+    import leonardo_client as leo
+    from leonardo_series_config import LEONARDO_GENERATION_DEFAULTS
+
+    if not api_key or not model_id:
+        st.error("Set LEONARDO_API_KEY.")
+        return None, None, None
+    text = (prompt or "").strip()
+    if not text:
+        st.warning("Enter a prompt first.")
+        return None, None, None
+    pos, neg = build_leonardo_reference_prompt(text, reading_level)
+    defaults = LEONARDO_GENERATION_DEFAULTS
+    try:
+        gen_id = leo.create_generation(
+            api_key,
+            pos[:1500],
+            model_id,
+            negative_prompt=neg[:1000],
+            width=int(defaults["width"]),
+            height=int(defaults["height"]),
+            num_images=1,
+            guidance_scale=float(defaults["guidance_scale"]),
+            preset_style=str(defaults["presetStyle"]),
+            alchemy=bool(defaults["alchemy"]),
+            controlnets=controlnets,
+        )
+        img, err, cost_line, gen_img_id = leo.poll_generation_until_done(
+            api_key, gen_id, interval_sec=2.0, max_wait_sec=360.0
+        )
+        if img is not None:
+            return img, cost_line, gen_img_id
+        st.error(f"Leonardo generation failed: {err or 'unknown'}")
+        return None, None, None
+    except Exception as e:
+        st.error(f"Leonardo error: {e}")
+        return None, None, None
 
 
 def _build_batch_request_parts(prompt: str, ref_images: Optional[List[bytes]] = None) -> list:
@@ -745,6 +973,7 @@ STORY_STYLE_COLUMNS = [
     "character_reference_image_url",
     "leonardo_seed",
     "default_image_provider",
+    "storybook_references",
 ]
 
 
@@ -777,14 +1006,24 @@ def upsert_story_grade_style(supabase, story_id: int, reading_level: str, data: 
                 row[k] = data[k]  # int or None
             elif k == "leonardo_seed":
                 row[k] = data[k]  # int or None
-            elif k == "reference_images":
+            elif k in ("reference_images", "storybook_references"):
                 v = data[k]
-                if v is None:
-                    row[k] = []
-                elif isinstance(v, str):
-                    row[k] = json.loads(v) if v.strip() else []
+                if k == "reference_images":
+                    if v is None:
+                        row[k] = []
+                    elif isinstance(v, str):
+                        row[k] = json.loads(v) if v.strip() else []
+                    else:
+                        row[k] = list(v)
                 else:
-                    row[k] = list(v)
+                    if v is None:
+                        row[k] = {}
+                    elif isinstance(v, str):
+                        row[k] = json.loads(v) if v.strip() else {}
+                    elif isinstance(v, dict):
+                        row[k] = v
+                    else:
+                        row[k] = {}
             else:
                 row[k] = data[k] if data[k] is not None else ""
         supabase.table("story_grade_styles").upsert(row, on_conflict="story_id,reading_level").execute()
@@ -972,6 +1211,97 @@ def _get_page_text(row: dict) -> str:
     return (row.get("page_text") or row.get("text") or "").strip()
 
 
+def page_number_for_row(row: dict) -> int:
+    v = row.get("page_index")
+    if v is None:
+        v = row.get(PAGE_NUMBER_COLUMN)
+    return int(v or 0)
+
+
+def is_image_anchor_page(page_number: int) -> bool:
+    return page_number % PAGES_PER_IMAGE == 0
+
+
+def image_block_start(page_number: int) -> int:
+    return (page_number // PAGES_PER_IMAGE) * PAGES_PER_IMAGE
+
+
+def uses_triple_page_images(reading_level: str) -> bool:
+    return reading_level in IMAGE_PROCESSOR_GRADES
+
+
+def format_page_range(block_start: int, block_end: int) -> str:
+    if block_start == block_end:
+        return str(block_start)
+    return f"{block_start}–{block_end}"
+
+
+def combined_text_for_pages(pages: List[dict]) -> str:
+    parts = [_get_page_text(p) for p in pages]
+    return "\n\n".join(p for p in parts if p)
+
+
+def group_pages_into_image_blocks(pages: List[dict]) -> List[dict]:
+    """Group ordered story pages into 3-page image blocks (anchor = first page of each block)."""
+    if not pages:
+        return []
+    sorted_pages = sorted(pages, key=page_number_for_row)
+    groups: Dict[int, List[dict]] = {}
+    for row in sorted_pages:
+        bs = image_block_start(page_number_for_row(row))
+        groups.setdefault(bs, []).append(row)
+    blocks = []
+    for bs in sorted(groups.keys()):
+        members = sorted(groups[bs], key=page_number_for_row)
+        anchor = members[0]
+        for m in members:
+            if is_image_anchor_page(page_number_for_row(m)):
+                anchor = m
+                break
+        end_pn = page_number_for_row(members[-1])
+        blocks.append(
+            {
+                "anchor_row": anchor,
+                "member_rows": members,
+                "combined_text": combined_text_for_pages(members),
+                "page_range_label": format_page_range(bs, end_pn),
+                "block_start": bs,
+            }
+        )
+    return blocks
+
+
+def block_needs_image(block: dict) -> bool:
+    urls = [(m.get("image_url") or "").strip() for m in block["member_rows"]]
+    if not any(urls):
+        return True
+    return not all(urls)
+
+
+def find_image_block_for_row_id(blocks: List[dict], row_id) -> Optional[dict]:
+    if row_id is None:
+        return None
+    for block in blocks:
+        for m in block["member_rows"]:
+            if m.get("id") == row_id:
+                return block
+    return None
+
+
+def apply_image_url_to_block(supabase, block: dict, image_url: str) -> Tuple[int, List[str]]:
+    """Write the same image_url to every row in the block. Returns (success_count, error labels)."""
+    url = (image_url or "").strip()
+    ok = 0
+    errs: List[str] = []
+    for member in block["member_rows"]:
+        rid = member.get("id")
+        pn = page_number_for_row(member)
+        if rid and update_book_page(supabase, rid, image_url=url):
+            ok += 1
+        else:
+            errs.append(f"page {pn}")
+    return ok, errs
+
 def insert_book_page(
     supabase,
     story_id: int,
@@ -1033,9 +1363,9 @@ def update_book_page(
         if page_index is not None:
             updates[PAGE_NUMBER_COLUMN] = page_index
         if audio_male_url is not None:
-            updates["audio_male_url"] = audio_male_url
+            updates["audio_male_url"] = (audio_male_url or "").strip() or None
         if audio_female_url is not None:
-            updates["audio_female_url"] = audio_female_url
+            updates["audio_female_url"] = (audio_female_url or "").strip() or None
         if timing_male_json is not None:
             updates["timing_male_json"] = timing_male_json
         if timing_female_json is not None:
@@ -1080,10 +1410,26 @@ def upload_reference_image_to_storage(
     supabase, story_id: int, reading_level: str, slot_index: int, image_bytes: bytes
 ) -> Optional[str]:
     """Upload a style reference image to R2 under refs/. Returns public URL or None."""
+    return upload_typed_reference_image(
+        supabase, story_id, reading_level, "ref", str(int(slot_index)), image_bytes
+    )
+
+
+def upload_typed_reference_image(
+    supabase,
+    story_id: int,
+    reading_level: str,
+    ref_type: str,
+    ref_id: str,
+    image_bytes: bytes,
+) -> Optional[str]:
+    """Upload reference image to R2 under refs/{type}_{id}.webp. Returns public URL or None."""
     from storage_r2 import upload_image
 
     opt = optimize_image_for_mobile(image_bytes)
-    path = f"{story_id}/{reading_level}/refs/ref_{int(slot_index)}.webp"
+    safe_type = (ref_type or "ref").strip().replace("/", "_")
+    safe_id = (ref_id or "0").strip().replace("/", "_")
+    path = f"{story_id}/{reading_level}/refs/{safe_type}_{safe_id}.webp"
     return upload_image(path, opt)
 
 
@@ -1091,10 +1437,9 @@ def upload_audio_to_storage(
     supabase, story_id: int, language_code: str, reading_level: str, page_index: int, audio_bytes: bytes, voice: str
 ) -> Optional[str]:
     """Upload audio to R2. voice is 'male' or 'female'. Returns public URL or None."""
-    from storage_r2 import upload_audio
-
-    path = f"{story_id}/{language_code}/{reading_level}/page_{page_index}_{voice}.mp3"
-    return upload_audio(path, audio_bytes)
+    return upload_audio_to_stories_path(
+        supabase, story_id, language_code, reading_level, voice, page_index, audio_bytes
+    )
 
 
 def fetch_localized_versions(supabase, story_id: int) -> List[dict]:
@@ -1162,7 +1507,9 @@ def fetch_pages_missing_audio(
 def fetch_pages_missing_images(
     supabase, story_id: int, language_code: str, reading_level: str
 ) -> List[dict]:
-    """Fetch story_content_flat for (story_id, language_code, reading_level) where image_url is NULL or empty. Ordered by page_number."""
+    """Fetch rows needing images. Grades 1–4: anchor page per 3-page block; grade 5: none."""
+    if reading_level == "grade_5":
+        return []
     try:
         r = (
             supabase.table(TABLE_STORY_CONTENT_FLAT)
@@ -1178,11 +1525,13 @@ def fetch_pages_missing_images(
             row["_display_text"] = _get_page_text(row)
             if "page_index" not in row:
                 row["page_index"] = row.get(PAGE_NUMBER_COLUMN)
-        return [
-            row
-            for row in rows
-            if not (row.get("image_url") or "").strip()
-        ]
+        if uses_triple_page_images(reading_level):
+            missing = []
+            for block in group_pages_into_image_blocks(rows):
+                if block_needs_image(block):
+                    missing.append(block["anchor_row"])
+            return missing
+        return [row for row in rows if not (row.get("image_url") or "").strip()]
     except Exception as e:
         st.error(f"Failed to fetch pages missing images: {e}")
         return []
@@ -1472,6 +1821,59 @@ def upload_audio_to_stories_path(
     return upload_audio(path, audio_bytes)
 
 
+def remove_page_audio(supabase, row_id: int, gender: str, old_url: Optional[str] = None) -> bool:
+    """Delete R2 audio object and clear URL + timing fields for male or female voice."""
+    from storage_r2 import delete_audio_by_url
+
+    if old_url:
+        delete_audio_by_url(old_url)
+    try:
+        updates = (
+            {"audio_male_url": None, "timing_male_json": None}
+            if gender == "male"
+            else {"audio_female_url": None, "timing_female_json": None}
+        )
+        supabase.table(TABLE_STORY_CONTENT_FLAT).update(updates).eq("id", row_id).execute()
+        return True
+    except Exception as e:
+        st.error(f"Failed to remove {gender} audio: {e}")
+        return False
+
+
+def approve_audio_for_page(
+    supabase,
+    *,
+    row_id: int,
+    story_id: int,
+    language_code: str,
+    reading_level: str,
+    gender: str,
+    page_index: int,
+    audio_bytes: bytes,
+    timing_json: Optional[dict],
+    old_url: Optional[str] = None,
+) -> Optional[str]:
+    """Delete old R2 audio, upload replacement, cache-bust URL, and update story_content_flat."""
+    from storage_r2 import delete_audio_by_url
+
+    if old_url:
+        delete_audio_by_url(old_url)
+    url = upload_audio_to_stories_path(
+        supabase, story_id, language_code, reading_level, gender, page_index, audio_bytes
+    )
+    if not url:
+        return None
+    url = f"{url}?v={int(time.time())}"
+    kwargs = (
+        {"audio_male_url": url, "timing_male_json": timing_json}
+        if gender == "male"
+        else {"audio_female_url": url, "timing_female_json": timing_json}
+    )
+    if update_book_page(supabase, row_id, **kwargs):
+        return url
+    return None
+
+
 @st.dialog("Replace audio", width="medium")
 def replace_audio_modal(row: dict, story_id: int, language_code: str, reading_level: str, voice: str):
     """Modal to upload male or female audio for a page."""
@@ -1485,16 +1887,24 @@ def replace_audio_modal(row: dict, story_id: int, language_code: str, reading_le
             else:
                 data = audio_file.read()
                 pn = row.get("page_index", row.get(PAGE_NUMBER_COLUMN, 0))
-                url = upload_audio_to_storage(
-                    get_supabase(), story_id, language_code, reading_level, pn, data, voice
+                old_url = (row.get("audio_male_url") if voice == "male" else row.get("audio_female_url")) or None
+                url = approve_audio_for_page(
+                    get_supabase(),
+                    row_id=row["id"],
+                    story_id=story_id,
+                    language_code=language_code,
+                    reading_level=reading_level,
+                    gender=voice,
+                    page_index=pn,
+                    audio_bytes=data,
+                    timing_json=None,
+                    old_url=old_url,
                 )
                 if url:
-                    field = "audio_male_url" if voice == "male" else "audio_female_url"
-                    if update_book_page(get_supabase(), row["id"], **{field: url}):
-                        st.success(f"{voice.capitalize()} audio uploaded.")
-                        if "bp_editing_audio" in st.session_state:
-                            del st.session_state.bp_editing_audio
-                        st.rerun()
+                    st.success(f"{voice.capitalize()} audio uploaded.")
+                    if "bp_editing_audio" in st.session_state:
+                        del st.session_state.bp_editing_audio
+                    st.rerun()
     with col2:
         if st.button("Cancel"):
             if "bp_editing_audio" in st.session_state:
@@ -1838,17 +2248,31 @@ def run_audio_generator_view(*, as_wizard_step: bool = False):
                         continue
                     if entry.get("male"):
                         b_bytes, t = entry["male"]
-                        url = upload_audio_to_stories_path(
-                            sb_save, b["story_id"], b["language_code"], reading_level_b, "male", page_index, b_bytes
-                        )
-                        if url and update_book_page(sb_save, row_id, audio_male_url=url, timing_male_json=t):
+                        if approve_audio_for_page(
+                            sb_save,
+                            row_id=row_id,
+                            story_id=b["story_id"],
+                            language_code=b["language_code"],
+                            reading_level=reading_level_b,
+                            gender="male",
+                            page_index=page_index,
+                            audio_bytes=b_bytes,
+                            timing_json=t,
+                        ):
                             ok += 1
                     if entry.get("female"):
                         b_bytes, t = entry["female"]
-                        url = upload_audio_to_stories_path(
-                            sb_save, b["story_id"], b["language_code"], reading_level_b, "female", page_index, b_bytes
-                        )
-                        if url and update_book_page(sb_save, row_id, audio_female_url=url, timing_female_json=t):
+                        if approve_audio_for_page(
+                            sb_save,
+                            row_id=row_id,
+                            story_id=b["story_id"],
+                            language_code=b["language_code"],
+                            reading_level=reading_level_b,
+                            gender="female",
+                            page_index=page_index,
+                            audio_bytes=b_bytes,
+                            timing_json=t,
+                        ):
                             ok += 1
             del st.session_state["ag_generated_batches"]
             st.success(f"Saved {ok} audio URLs to story_content_flat (all levels).")
@@ -1882,17 +2306,31 @@ def run_audio_generator_view(*, as_wizard_step: bool = False):
                 reading_level = batch.get("reading_level") or ""
                 if entry.get("male"):
                     b, t = entry["male"]
-                    url = upload_audio_to_stories_path(
-                        sb_save, batch["story_id"], batch["language_code"], reading_level, "male", page_index, b
-                    )
-                    if url and update_book_page(sb_save, row_id, audio_male_url=url, timing_male_json=t):
+                    if approve_audio_for_page(
+                        sb_save,
+                        row_id=row_id,
+                        story_id=batch["story_id"],
+                        language_code=batch["language_code"],
+                        reading_level=reading_level,
+                        gender="male",
+                        page_index=page_index,
+                        audio_bytes=b,
+                        timing_json=t,
+                    ):
                         ok += 1
                 if entry.get("female"):
                     b, t = entry["female"]
-                    url = upload_audio_to_stories_path(
-                        sb_save, batch["story_id"], batch["language_code"], reading_level, "female", page_index, b
-                    )
-                    if url and update_book_page(sb_save, row_id, audio_female_url=url, timing_female_json=t):
+                    if approve_audio_for_page(
+                        sb_save,
+                        row_id=row_id,
+                        story_id=batch["story_id"],
+                        language_code=batch["language_code"],
+                        reading_level=reading_level,
+                        gender="female",
+                        page_index=page_index,
+                        audio_bytes=b,
+                        timing_json=t,
+                    ):
                         ok += 1
             del st.session_state["ag_generated_batch"]
             st.success(f"Saved {ok} audio URLs to story_content_flat (Story {batch['story_id']}, {batch['language_code']}, {batch.get('reading_level', '')}).")
@@ -1938,6 +2376,117 @@ def run_audio_generator_view(*, as_wizard_step: bool = False):
             else:
                 st.caption("—")
         st.divider()
+
+
+def _book_page_audio_voice_section(
+    sb,
+    *,
+    voice: str,
+    row_id: int,
+    story_id: int,
+    language_code: str,
+    reading_level: str,
+    page_idx: int,
+    page_text: str,
+    new_text: str,
+    selected_row: dict,
+    voices: list,
+    voice_select_index: int,
+    speed: float,
+):
+    """Render regenerate / remove / upload / preview / approve UI for one voice."""
+    label = voice.capitalize()
+    url = (selected_row.get(f"audio_{voice}_url") or "").strip() or None
+    key_prefix = voice[0]
+
+    st.markdown(f"**{label} audio**")
+    if url:
+        st.audio(url, format="audio/mpeg")
+    else:
+        st.caption("—")
+
+    pending_all = st.session_state.setdefault("bp_pending_audio", {})
+    pending_row = pending_all.setdefault(row_id, {})
+    pending_entry = pending_row.get(voice)
+
+    btn_col1, btn_col2, btn_col3 = st.columns(3)
+    with btn_col1:
+        if st.button(f"Regenerate {voice}", key=f"bp_regen_{key_prefix}_{row_id}"):
+            api_key = get_secret("ELEVENLABS_API_KEY")
+            if not api_key:
+                st.error("Set ELEVENLABS_API_KEY in .env for Regenerate audio.")
+            else:
+                text_for_audio = (st.session_state.get(f"bp_text_{row_id}", new_text) or "").strip() or page_text
+                if not text_for_audio:
+                    st.warning("Page text is empty.")
+                else:
+                    voice_id = voices[voice_select_index][1]
+                    with st.spinner(f"Generating {voice} audio..."):
+                        audio_bytes, timing = generate_elevenlabs_audio(
+                            api_key,
+                            voice_id,
+                            text_for_audio,
+                            language_code,
+                            stability=0.5,
+                            similarity_boost=0.75,
+                            speed=speed,
+                            model_id=ELEVENLABS_TTS_MODEL_ID,
+                            output_format=ELEVENLABS_TTS_OUTPUT_FORMAT,
+                            optimize_streaming_latency=0,
+                            apply_text_normalization="auto",
+                        )
+                    if audio_bytes:
+                        pending_row[voice] = (audio_bytes, timing)
+                        st.success(f"{label} audio generated. Preview below, then Approve and save.")
+                        st.rerun()
+                    else:
+                        st.error("Audio generation failed.")
+    with btn_col2:
+        if url and st.button(f"Remove {voice}", key=f"bp_remove_{key_prefix}_{row_id}", type="secondary"):
+            if remove_page_audio(sb, row_id, voice, old_url=url):
+                pending_row.pop(voice, None)
+                if not pending_row:
+                    pending_all.pop(row_id, None)
+                st.success(f"{label} audio removed.")
+                st.rerun()
+    with btn_col3:
+        if st.button(f"Upload {voice} audio", key=f"bp_upload_{key_prefix}_{row_id}"):
+            st.session_state.bp_editing_audio = (selected_row, voice)
+            st.rerun()
+
+    if pending_entry:
+        audio_bytes, timing = pending_entry
+        st.caption("Preview (not saved until you approve)")
+        st.audio(audio_bytes, format="audio/mpeg")
+        ap_col1, ap_col2 = st.columns(2)
+        with ap_col1:
+            if st.button(f"Approve and save {voice}", key=f"bp_approve_{key_prefix}_{row_id}", type="primary"):
+                result = approve_audio_for_page(
+                    sb,
+                    row_id=row_id,
+                    story_id=story_id,
+                    language_code=language_code,
+                    reading_level=reading_level,
+                    gender=voice,
+                    page_index=page_idx,
+                    audio_bytes=audio_bytes,
+                    timing_json=timing,
+                    old_url=url,
+                )
+                if result:
+                    pending_row.pop(voice, None)
+                    if not pending_row:
+                        pending_all.pop(row_id, None)
+                    st.success(f"{label} audio saved.")
+                    st.rerun()
+                else:
+                    st.error("Upload or save failed.")
+        with ap_col2:
+            if st.button(f"Discard {voice}", key=f"bp_discard_{key_prefix}_{row_id}"):
+                pending_row.pop(voice, None)
+                if not pending_row:
+                    pending_all.pop(row_id, None)
+                st.rerun()
 
 
 def run_book_pages_view():
@@ -2208,88 +2757,36 @@ def run_book_pages_view():
                     st.success("Image removed.")
                     st.rerun()
 
-        # Male / Female audio
-        st.markdown("**Male audio**")
-        male_url = selected_row.get("audio_male_url")
-        if male_url:
-            st.audio(male_url, format="audio/mpeg")
-        else:
-            st.caption("—")
-        a1, a2 = st.columns(2)
-        with a1:
-            if st.button("Regenerate male", key=f"bp_regen_m_{row_id}"):
-                api_key = get_secret("ELEVENLABS_API_KEY")
-                if not api_key:
-                    st.error("Set ELEVENLABS_API_KEY in .env for Regenerate audio.")
-                else:
-                    text_for_audio = (st.session_state.get(f"bp_text_{row_id}", new_text) or "").strip() or page_text
-                    if not text_for_audio:
-                        st.warning("Page text is empty.")
-                    else:
-                        voice_id = VOICES_MALE[bp_voice_male][1]
-                        with st.spinner("Generating male audio..."):
-                            audio_bytes, timing = generate_elevenlabs_audio(
-                                api_key, voice_id, text_for_audio, language_code,
-                                stability=0.5, similarity_boost=0.75, speed=bp_speed,
-                                model_id=ELEVENLABS_TTS_MODEL_ID,
-                                output_format=ELEVENLABS_TTS_OUTPUT_FORMAT,
-                                optimize_streaming_latency=0,
-                                apply_text_normalization="auto",
-                            )
-                        if audio_bytes:
-                            url_audio = upload_audio_to_stories_path(sb, story_id, language_code, reading_level, "male", page_idx, audio_bytes)
-                            if url_audio and update_book_page(sb, row_id, audio_male_url=url_audio, timing_male_json=timing):
-                                st.success("Male audio regenerated and saved.")
-                                st.rerun()
-                            else:
-                                st.error("Upload or save failed.")
-                        else:
-                            st.error("Audio generation failed.")
-        with a2:
-            if st.button("Upload male audio", key=f"bp_upload_m_{row_id}"):
-                st.session_state.bp_editing_audio = (selected_row, "male")
-                st.rerun()
-
-        st.markdown("**Female audio**")
-        female_url = selected_row.get("audio_female_url")
-        if female_url:
-            st.audio(female_url, format="audio/mpeg")
-        else:
-            st.caption("—")
-        f1, f2 = st.columns(2)
-        with f1:
-            if st.button("Regenerate female", key=f"bp_regen_f_{row_id}"):
-                api_key = get_secret("ELEVENLABS_API_KEY")
-                if not api_key:
-                    st.error("Set ELEVENLABS_API_KEY in .env for Regenerate audio.")
-                else:
-                    text_for_audio = (st.session_state.get(f"bp_text_{row_id}", new_text) or "").strip() or page_text
-                    if not text_for_audio:
-                        st.warning("Page text is empty.")
-                    else:
-                        voice_id = VOICES_FEMALE[bp_voice_female][1]
-                        with st.spinner("Generating female audio..."):
-                            audio_bytes, timing = generate_elevenlabs_audio(
-                                api_key, voice_id, text_for_audio, language_code,
-                                stability=0.5, similarity_boost=0.75, speed=bp_speed,
-                                model_id=ELEVENLABS_TTS_MODEL_ID,
-                                output_format=ELEVENLABS_TTS_OUTPUT_FORMAT,
-                                optimize_streaming_latency=0,
-                                apply_text_normalization="auto",
-                            )
-                        if audio_bytes:
-                            url_audio = upload_audio_to_stories_path(sb, story_id, language_code, reading_level, "female", page_idx, audio_bytes)
-                            if url_audio and update_book_page(sb, row_id, audio_female_url=url_audio, timing_female_json=timing):
-                                st.success("Female audio regenerated and saved.")
-                                st.rerun()
-                            else:
-                                st.error("Upload or save failed.")
-                        else:
-                            st.error("Audio generation failed.")
-        with f2:
-            if st.button("Upload female audio", key=f"bp_upload_f_{row_id}"):
-                st.session_state.bp_editing_audio = (selected_row, "female")
-                st.rerun()
+        _book_page_audio_voice_section(
+            sb,
+            voice="male",
+            row_id=row_id,
+            story_id=story_id,
+            language_code=language_code,
+            reading_level=reading_level,
+            page_idx=page_idx,
+            page_text=page_text,
+            new_text=new_text,
+            selected_row=selected_row,
+            voices=VOICES_MALE,
+            voice_select_index=bp_voice_male,
+            speed=bp_speed,
+        )
+        _book_page_audio_voice_section(
+            sb,
+            voice="female",
+            row_id=row_id,
+            story_id=story_id,
+            language_code=language_code,
+            reading_level=reading_level,
+            page_idx=page_idx,
+            page_text=page_text,
+            new_text=new_text,
+            selected_row=selected_row,
+            voices=VOICES_FEMALE,
+            voice_select_index=bp_voice_female,
+            speed=bp_speed,
+        )
 
         # Delete
         with st.expander("Danger zone", expanded=False):

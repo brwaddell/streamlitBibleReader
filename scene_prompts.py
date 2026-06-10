@@ -51,6 +51,7 @@ def suggest_scene_prompt(
     global_style: str = "",
     story_title: str = "",
     model: str = "gpt-4o-mini",
+    page_range_label: str = "",
 ) -> Optional[Dict[str, Any]]:
     """
     Call OpenAI for structured scene breakdown. Returns dict with scene_visual, composition, etc., or None on error.
@@ -59,10 +60,16 @@ def suggest_scene_prompt(
         return None
     title_line = f'Story title: "{story_title}". ' if story_title else ""
     style_line = f"Style context only—do not echo style jargon in scene fields: {global_style[:500]}\n" if global_style else ""
+    range_line = (
+        f"This single illustration covers story pages {page_range_label}. "
+        if page_range_label
+        else ""
+    )
     user = (
         f"{title_line}{style_line}"
+        f"{range_line}"
         f"Cast/continuity (director notes): {character_ref or 'main story characters'}.\n"
-        f'Page text: """{(page_text or "").strip()[:4000]}"""\n\n'
+        f'Combined page text: """{(page_text or "").strip()[:4000]}"""\n\n'
         f"{SCENE_JSON_INSTRUCTION}"
     )
     try:

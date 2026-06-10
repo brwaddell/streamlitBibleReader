@@ -1,8 +1,15 @@
 """Default image style presets per reading level (Image Processor Settings tab)."""
 
 DEFAULT_CHARACTER_REF = (
-    "Middle eastern characters, period appropriate clothes and tools and personal items. "
-    "No duplicate people, no human figures to represent God"
+    "Single character portrait, neutral standing pose, plain simple background. "
+    "Middle Eastern appearance, ancient Near East period clothing. "
+    "One person only, no duplicate figures, no human figures to represent God."
+)
+
+DEFAULT_LOCATION_REF = (
+    "Empty environment reference plate, wide establishing shot. "
+    "Architecture, lighting, and mood only — no people, no characters, no figures. "
+    "Reusable background setting for storybook scenes."
 )
 
 GRADE_STYLE_DEFAULTS = {
@@ -52,3 +59,38 @@ GRADE_STYLE_DEFAULTS = {
         "default_image_provider": "leonardo",
     },
 }
+
+
+def grade_style_defaults_for(reading_level: str) -> dict:
+    """Return preset dict for a reading level (falls back to grade_1)."""
+    return dict(GRADE_STYLE_DEFAULTS.get(reading_level, GRADE_STYLE_DEFAULTS["grade_1"]))
+
+
+def series_style_prompt_for_grade(reading_level: str) -> str:
+    """Editable default prompt for the series style reference textarea."""
+    g = grade_style_defaults_for(reading_level)
+    parts = [
+        (g.get("global_style") or "").strip(),
+        f"Colors: {g['color_palette']}" if (g.get("color_palette") or "").strip() else "",
+        f"Lighting: {g['lighting']}" if (g.get("lighting") or "").strip() else "",
+        f"Framing: {g['framing']}" if (g.get("framing") or "").strip() else "",
+        (g.get("age_appropriateness") or "").strip(),
+    ]
+    return ". ".join(p for p in parts if p)
+
+
+def character_ref_prompt_for_grade(reading_level: str) -> str:
+    """Editable default for character reference prompt textarea."""
+    return (grade_style_defaults_for(reading_level).get("character_ref") or DEFAULT_CHARACTER_REF).strip()
+
+
+def location_ref_prompt_for_grade(reading_level: str) -> str:
+    """Editable default for location reference prompt textarea."""
+    g = grade_style_defaults_for(reading_level)
+    parts = [
+        DEFAULT_LOCATION_REF,
+        (g.get("global_style") or "").strip(),
+        f"Lighting: {g['lighting']}" if (g.get("lighting") or "").strip() else "",
+    ]
+    return ". ".join(p for p in parts if p)
+

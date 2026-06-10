@@ -72,6 +72,42 @@ def upload_image(path: str, image_bytes: bytes) -> Optional[str]:
         return None
 
 
+def r2_key_from_public_url(url: str, base_url: str) -> Optional[str]:
+    """Extract R2 object key from a public URL (strips domain and query string)."""
+    if not url or not base_url:
+        return None
+    base = _ensure_audio_domain(base_url).rstrip("/")
+    clean = (url or "").split("?")[0].rstrip("/")
+    prefix = f"{base}/"
+    if clean.startswith(prefix):
+        return clean[len(prefix) :]
+    return None
+
+
+def delete_audio(path: str) -> bool:
+    """Delete an audio object from R2 by key. Missing keys are OK."""
+    client = _get_r2_client()
+    bucket = get_secret("R2_BUCKET_AUDIO", "storybook-audio")
+    if not client or not path:
+        return False
+    try:
+        client.delete_object(Bucket=bucket, Key=path)
+        return True
+    except Exception:
+        return False
+
+
+def delete_audio_by_url(url: str) -> bool:
+    """Delete an audio object from R2 using its public URL."""
+    base_url = get_secret("R2_PUBLIC_URL_AUDIO")
+    if not base_url:
+        return False
+    key = r2_key_from_public_url(url, base_url)
+    if not key:
+        return False
+    return delete_audio(key)
+
+
 def upload_audio(path: str, audio_bytes: bytes) -> Optional[str]:
     """Upload audio to R2. Returns public URL or None."""
     client = _get_r2_client()

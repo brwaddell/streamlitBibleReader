@@ -16,6 +16,8 @@ PHOENIX_MODEL_IDS = frozenset({PHOENIX_1_MODEL_ID.lower(), PHOENIX_09_MODEL_ID.l
 # Legacy SD-style models — Character Reference often uses 133 (see Image Guidance docs per model).
 DEFAULT_CHARACTER_PREPROCESSOR_ID = int(os.getenv("LEONARDO_CHARACTER_PREPROCESSOR_ID", "133"))
 DEFAULT_PHOENIX_CHARACTER_PREPROCESSOR_ID = int(os.getenv("LEONARDO_PHOENIX_CHARACTER_PREPROCESSOR_ID", "397"))
+DEFAULT_PHOENIX_STYLE_PREPROCESSOR_ID = int(os.getenv("LEONARDO_PHOENIX_STYLE_PREPROCESSOR_ID", "166"))
+DEFAULT_PHOENIX_CONTENT_PREPROCESSOR_ID = int(os.getenv("LEONARDO_PHOENIX_CONTENT_PREPROCESSOR_ID", "364"))
 # Phoenix requires contrast in {3, 3.5, 4} when using Quality/Alchemy path. Default 3 = softer, less harsh than 3.5.
 DEFAULT_PHOENIX_CONTRAST = float(os.getenv("LEONARDO_PHOENIX_CONTRAST", "3"))
 
@@ -61,6 +63,27 @@ def character_preprocessor_for_model(model_id: str) -> int:
     if is_phoenix_model(model_id):
         return DEFAULT_PHOENIX_CHARACTER_PREPROCESSOR_ID
     return DEFAULT_CHARACTER_PREPROCESSOR_ID
+
+
+def storybook_controlnet_preprocessors_for_model(model_id: str) -> Tuple[int, int, int]:
+    """Return (style, character, location/content) preprocessor IDs for the given model."""
+    if is_phoenix_model(model_id):
+        return (
+            DEFAULT_PHOENIX_STYLE_PREPROCESSOR_ID,
+            DEFAULT_PHOENIX_CHARACTER_PREPROCESSOR_ID,
+            DEFAULT_PHOENIX_CONTENT_PREPROCESSOR_ID,
+        )
+    from leonardo_series_config import (
+        CHARACTER_CONTROLNET_PREPROCESSOR_ID,
+        LOCATION_CONTROLNET_PREPROCESSOR_ID,
+        STYLE_CONTROLNET_PREPROCESSOR_ID,
+    )
+
+    return (
+        STYLE_CONTROLNET_PREPROCESSOR_ID,
+        CHARACTER_CONTROLNET_PREPROCESSOR_ID,
+        LOCATION_CONTROLNET_PREPROCESSOR_ID,
+    )
 
 
 def _snap_phoenix_contrast(value: float) -> float:
@@ -230,16 +253,27 @@ def format_generation_cost(gen: Optional[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
+def _first_generated_image_id(gen: Optional[Dict[str, Any]]) -> Optional[str]:
+    if not gen or not isinstance(gen, dict):
+        return None
+    images = gen.get("generated_images") or gen.get("generatedImages") or []
+    if not images:
+        return None
+    img = images[0] or {}
+    gid = img.get("id") or img.get("generated_image_id") or img.get("generatedImageId")
+    return str(gid).strip() if gid else None
+
+
 def poll_generation_until_done(
     api_key: str,
     generation_id: str,
     *,
     interval_sec: float = 2.0,
     max_wait_sec: float = 300.0,
-) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
+) -> Tuple[Optional[bytes], Optional[str], Optional[str], Optional[str]]:
     """
     Poll GET /generations/{id} until COMPLETE, FAILED, or timeout.
-    Returns (image_bytes, error_message, cost_caption). On success error is None; cost_caption may be None if API omits it.
+    Returns (image_bytes, error_message, cost_caption, generated_image_id).
     """
     deadline = time.monotonic() + max_wait_sec
     while time.monotonic() < deadline:
@@ -251,19 +285,139 @@ def poll_generation_until_done(
         if status == "COMPLETE":
             images = gen.get("generated_images") or gen.get("generatedImages") or []
             if not images:
-                return None, "COMPLETE but no generated_images", None
+                return None, "COMPLETE but no generated_images", None, None
             url = (images[0] or {}).get("url")
             if not url:
-                return None, "COMPLETE but no image url", None
+                return None, "COMPLETE but no image url", None, None
             try:
                 cost_line = format_generation_cost(gen)
-                return download_image(url), None, cost_line
+                gen_img_id = _first_generated_image_id(gen)
+                return download_image(url), None, cost_line, gen_img_id
             except Exception as e:
-                return None, str(e), None
+                return None, str(e), None, None
         if status == "FAILED":
-            return None, "Generation FAILED", None
+            return None, "Generation FAILED", None, None
         time.sleep(interval_sec)
-    return None, "Timeout waiting for Leonardo generation", None
+    return None, "Timeout waiting for Leonardo generation", None, None
+
+
+def build_partial_storybook_controlnets(
+    style_ref: Optional[Dict[str, Any]] = None,
+    character_ref: Optional[Dict[str, Any]] = None,
+    location_ref: Optional[Dict[str, Any]] = None,
+    *,
+    model_id: str = "",
+) -> List[Dict[str, Any]]:
+    """Build 0–3 controlnets from approved DB reference entries (all optional)."""
+    from leonardo_series_config import (
+        CHARACTER_CONTROLNET_STRENGTH,
+        LOCATION_CONTROLNET_STRENGTH,
+        STYLE_CONTROLNET_STRENGTH,
+    )
+
+    style_pid, char_pid, loc_pid = storybook_controlnet_preprocessors_for_model(model_id)
+
+    cn: List[Dict[str, Any]] = []
+    if style_ref:
+        sid = (style_ref.get("leonardo_init_image_id") or "").strip()
+        if sid:
+            cn.append(
+                {
+                    "initImageId": sid,
+                    "initImageType": "GENERATED",
+                    "preprocessorId": style_pid,
+                    "strengthType": STYLE_CONTROLNET_STRENGTH,
+                }
+            )
+    if character_ref:
+        cid = (character_ref.get("leonardo_init_image_id") or "").strip()
+        if cid:
+            cn.append(
+                {
+                    "initImageId": cid,
+                    "initImageType": "UPLOADED",
+                    "preprocessorId": char_pid,
+                    "strengthType": CHARACTER_CONTROLNET_STRENGTH,
+                }
+            )
+    if location_ref:
+        lid = (location_ref.get("leonardo_init_image_id") or "").strip()
+        if lid:
+            cn.append(
+                {
+                    "initImageId": lid,
+                    "initImageType": "GENERATED",
+                    "preprocessorId": loc_pid,
+                    "strengthType": LOCATION_CONTROLNET_STRENGTH,
+                }
+            )
+    return cn
+
+
+def build_storybook_controlnets(
+    style_ref: Dict[str, Any],
+    character_init_image_id: str,
+    location_ref: Dict[str, Any],
+    *,
+    model_id: str = "",
+) -> List[Dict[str, Any]]:
+    """Style (High) + character (Mid) + location (Low) controlnets for storybook consistency."""
+    style_pid, char_pid, loc_pid = storybook_controlnet_preprocessors_for_model(model_id)
+    return [
+        {
+            "initImageId": str(style_ref["init_image_id"]).strip(),
+            "initImageType": style_ref.get("init_image_type", "GENERATED"),
+            "preprocessorId": int(style_ref.get("preprocessor_id", style_pid)),
+            "strengthType": style_ref.get("strength_type", "High"),
+        },
+        {
+            "initImageId": str(character_init_image_id).strip(),
+            "initImageType": "UPLOADED",
+            "preprocessorId": char_pid,
+            "strengthType": "Mid",
+        },
+        {
+            "initImageId": str(location_ref["init_image_id"]).strip(),
+            "initImageType": location_ref.get("init_image_type", "GENERATED"),
+            "preprocessorId": int(location_ref.get("preprocessor_id", loc_pid)),
+            "strengthType": location_ref.get("strength_type", "Low"),
+        },
+    ]
+
+
+def resolve_character_init_image_id(api_key: str, character_entry: Dict[str, Any]) -> str:
+    """Return Leonardo init image id; upload from image_url when init_image_id is not configured."""
+    init_id = (character_entry.get("init_image_id") or "").strip()
+    if init_id and not init_id.startswith("<"):
+        return init_id
+    url = (character_entry.get("image_url") or "").strip()
+    if not url or url.startswith("https://example.com") or url.startswith("<"):
+        label = character_entry.get("label") or character_entry.get("id") or "Character"
+        raise ValueError(
+            f"Character '{label}' needs init_image_id or a public image_url in leonardo_series_config.py"
+        )
+    r = requests.get(url, timeout=120)
+    r.raise_for_status()
+    return upload_init_image_bytes(api_key, r.content)
+
+
+def resolve_storybook_controlnets(
+    api_key: str,
+    style_ref: Dict[str, Any],
+    character_entry: Dict[str, Any],
+    location_entry: Dict[str, Any],
+    *,
+    model_id: str = "",
+) -> List[Dict[str, Any]]:
+    style_id = (style_ref.get("init_image_id") or "").strip()
+    if not style_id or style_id.startswith("<"):
+        raise ValueError("STYLE_REFERENCE.init_image_id is not configured in leonardo_series_config.py")
+    loc_id = (location_entry.get("init_image_id") or "").strip()
+    if not loc_id or loc_id.startswith("<"):
+        label = location_entry.get("label") or location_entry.get("id") or "Location"
+        raise ValueError(f"Location '{label}' init_image_id is not configured in leonardo_series_config.py")
+    char_id = resolve_character_init_image_id(api_key, character_entry)
+    return build_storybook_controlnets(style_ref, char_id, location_entry, model_id=model_id)
 
 
 def character_reference_controlnets(
