@@ -503,6 +503,7 @@ def build_simple_leonardo_prompt(
     scene_description: str,
     reading_level: Optional[str] = None,
     *,
+    style_scene: Optional[str] = None,
     character_ref: Optional[Dict[str, Any]] = None,
     location_ref: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
@@ -516,8 +517,11 @@ def build_simple_leonardo_prompt(
     parts = [
         LEONARDO_ILLUSTRATOR_LOCK.strip(),
         LEONARDO_POSITIVE_IMAGE_RULES,
-        f"SCENE (primary — composition and action must follow this): {scene}",
     ]
+    style = (style_scene or "").strip()
+    if style:
+        parts.append(f"STYLE SCENE (world, setting, and visual tone for this book): {style}")
+    parts.append(f"SCENE (this illustration — composition and action must follow this): {scene}")
     if character_ref:
         label = (character_ref.get("label") or "the character").strip()
         parts.append(

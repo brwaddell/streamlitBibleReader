@@ -1,5 +1,7 @@
 """Default image style presets per reading level (Image Processor Settings tab)."""
 
+from typing import Optional
+
 DEFAULT_CHARACTER_REF = (
     "Single character portrait, neutral standing pose, plain simple background. "
     "Middle Eastern appearance, ancient Near East period clothing. "
@@ -93,4 +95,28 @@ def location_ref_prompt_for_grade(reading_level: str) -> str:
         f"Lighting: {g['lighting']}" if (g.get("lighting") or "").strip() else "",
     ]
     return ". ".join(p for p in parts if p)
+
+
+def grade_scene_settings_for_prompt(
+    reading_level: str, saved_style: Optional[dict] = None
+) -> str:
+    """Format age/grade scene defaults for ChatGPT scene planning (saved overrides merged in)."""
+    defaults = grade_style_defaults_for(reading_level)
+    saved = saved_style or {}
+
+    def _field(key: str) -> str:
+        return (saved.get(key) or defaults.get(key) or "").strip()
+
+    lines = []
+    if _field("age_appropriateness"):
+        lines.append(f"Audience: {_field('age_appropriateness')}")
+    if _field("global_style"):
+        lines.append(f"Visual style: {_field('global_style')}")
+    if _field("color_palette"):
+        lines.append(f"Color palette: {_field('color_palette')}")
+    if _field("lighting"):
+        lines.append(f"Lighting: {_field('lighting')}")
+    if _field("framing"):
+        lines.append(f"Framing/composition: {_field('framing')}")
+    return "\n".join(lines)
 

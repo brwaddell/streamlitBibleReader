@@ -8,11 +8,15 @@ import leonardo_client as leo
 from auth import get_secret
 from grade_style_defaults import (
     character_ref_prompt_for_grade,
-    location_ref_prompt_for_grade,
+    grade_scene_settings_for_prompt,
     series_style_prompt_for_grade,
 )
 from leonardo_series_config import LEONARDO_GENERATION_DEFAULTS
-from scene_prompts import generate_all_scene_descriptions, generate_scene_description_paragraph
+from scene_prompts import (
+    generate_all_scene_descriptions,
+    generate_scene_description_paragraph,
+    generate_style_scene_description,
+)
 from translator_page import get_openai
 from lib import (
     IMAGE_PROCESSOR_GRADES,
@@ -26,14 +30,11 @@ from lib import (
     fetch_stories,
     find_character_ref_by_id,
     find_image_block_for_row_id,
-    find_location_ref_by_id,
     generate_image_leonardo,
     generate_leonardo_reference_preview,
     get_approved_character_refs,
-    get_approved_location_refs,
     get_approved_style_ref,
     get_saved_character_refs,
-    get_saved_location_refs,
     get_saved_style_ref,
     get_story_grade_style,
     get_supabase,
@@ -139,6 +140,7 @@ def _cached_get_story_grade_style(story_id: int, reading_level: str, _cache_vers
 
 def _bump_ip_cache_version():
     st.session_state["ip_cache_version"] = st.session_state.get("ip_cache_version", 0) + 1
+    _cached_get_story_grade_style.clear()
 
 
 def _stash_storybook_refs(scope: str, refs: Dict[str, Any]) -> None:
@@ -146,16 +148,7 @@ def _stash_storybook_refs(scope: str, refs: Dict[str, Any]) -> None:
 
 
 def _load_storybook_refs(scope: str, grade_style) -> Dict[str, Any]:
-    refs = storybook_references_from_grade_style(grade_style)
-    has_saved = bool(
-        get_saved_style_ref(refs)
-        or get_saved_character_refs(refs)
-        or get_saved_location_refs(refs)
-    )
-    if has_saved:
-        return refs
-    stashed = st.session_state.get(f"ip_refs_{scope}")
-    return stashed if isinstance(stashed, dict) else refs
+    return storybook_references_from_grade_style(grade_style)
 
 
 def _just_approved_url(just_approved: Dict[Any, Any], row_id) -> str:
@@ -178,14 +171,15 @@ def _resolve_page_image_url(
 
 
 def _seed_grade_prompt_defaults(scope: str, reading_level: str) -> None:
-    """Pre-fill reference prompt text areas from grade presets when story/grade changes."""
+    """Pre-fill prompt text areas from grade presets when story/grade changes."""
     loaded_for = st.session_state.get("ip_grade_prompts_loaded_for")
     if loaded_for == scope:
         return
     st.session_state["ip_grade_prompts_loaded_for"] = scope
-    st.session_state[f"ip_style_prompt_{scope}"] = series_style_prompt_for_grade(reading_level)
+    style_key = _style_scene_session_key(scope)
+    if not (st.session_state.get(style_key) or "").strip():
+        st.session_state[style_key] = series_style_prompt_for_grade(reading_level)
     st.session_state[f"ip_char_prompt_{scope}"] = character_ref_prompt_for_grade(reading_level)
-    st.session_state[f"ip_loc_prompt_{scope}"] = location_ref_prompt_for_grade(reading_level)
 
 
 def _style_only_controlnets(refs: Dict[str, Any], model_id: str) -> Optional[List[Dict[str, Any]]]:
@@ -196,14 +190,11 @@ def _style_only_controlnets(refs: Dict[str, Any], model_id: str) -> Optional[Lis
     return cn or None
 
 
-def _block_char_loc_ids(scope: str, row_id) -> tuple[str, str]:
+def _block_char_id(scope: str, row_id) -> str:
     char_key = f"ip_char_{row_id}"
-    loc_key = f"ip_loc_{row_id}"
     grade_char_key = f"ip_grade_char_{scope}"
-    grade_loc_key = f"ip_grade_loc_{scope}"
     char_id = st.session_state.get(char_key, st.session_state.get(grade_char_key, _REF_NONE))
-    loc_id = st.session_state.get(loc_key, st.session_state.get(grade_loc_key, _REF_NONE))
-    return char_id or _REF_NONE, loc_id or _REF_NONE
+    return char_id or _REF_NONE
 
 
 def _blocks_ready_for_bulk_generate(
@@ -234,14 +225,10 @@ def _story_meta(stories: list, story_id: int) -> Dict[str, str]:
 
 
 def _ref_text_for_block(
-    refs: Dict[str, Any], scope: str, row_id, *, kind: str
+    refs: Dict[str, Any], scope: str, row_id,
 ) -> str:
-    if kind == "character":
-        char_id, _ = _block_char_loc_ids(scope, row_id)
-        ref = find_character_ref_by_id(refs, char_id) if char_id else None
-    else:
-        _, loc_id = _block_char_loc_ids(scope, row_id)
-        ref = find_location_ref_by_id(refs, loc_id) if loc_id else None
+    char_id = _block_char_id(scope, row_id)
+    ref = find_character_ref_by_id(refs, char_id) if char_id else None
     if not ref:
         return ""
     label = (ref.get("label") or "").strip()
@@ -251,13 +238,9 @@ def _ref_text_for_block(
     return label or prompt
 
 
-def _all_refs_text(refs: Dict[str, Any], *, kind: str) -> str:
-    if kind == "character":
-        entries = get_approved_character_refs(refs)
-    else:
-        entries = get_approved_location_refs(refs)
+def _all_character_refs_text(refs: Dict[str, Any]) -> str:
     lines: List[str] = []
-    for entry in entries:
+    for entry in get_approved_character_refs(refs):
         label = (entry.get("label") or "").strip()
         prompt = (entry.get("prompt") or "").strip()
         if label and prompt:
@@ -284,12 +267,45 @@ def _block_prompt_payload(block: dict) -> dict:
     }
 
 
+def _style_scene_session_key(scope: str) -> str:
+    return f"ip_story_style_scene_{scope}"
+
+
+def _get_style_scene(scope: str) -> str:
+    return (st.session_state.get(_style_scene_session_key(scope)) or "").strip()
+
+
+def _generate_style_scene_for_story(
+    blocks: List[dict],
+    *,
+    story_title: str,
+    story_summary: str,
+    reading_level: str,
+    grade_style: Optional[dict],
+) -> Optional[str]:
+    client = get_openai()
+    if not client or not blocks:
+        return None
+    payloads = [_block_prompt_payload(b) for b in blocks]
+    return generate_style_scene_description(
+        client,
+        payloads,
+        story_title=story_title,
+        story_summary=story_summary,
+        default_style_scene=series_style_prompt_for_grade(reading_level),
+        grade_scene_settings=grade_scene_settings_for_prompt(reading_level, grade_style),
+    )
+
+
 def _generate_scenes_for_full_story(
     blocks: List[dict],
     *,
     story_title: str,
     story_summary: str,
+    reading_level: str,
+    grade_style: Optional[dict],
     refs: Dict[str, Any],
+    scope: str,
 ) -> Optional[Dict[int, str]]:
     client = get_openai()
     if not client or not blocks:
@@ -300,8 +316,9 @@ def _generate_scenes_for_full_story(
         payloads,
         story_title=story_title,
         story_summary=story_summary,
-        character_refs=_all_refs_text(refs, kind="character"),
-        location_refs=_all_refs_text(refs, kind="location"),
+        character_refs=_all_character_refs_text(refs),
+        style_scene=_get_style_scene(scope),
+        grade_scene_settings=grade_scene_settings_for_prompt(reading_level, grade_style),
         pages_per_image=PAGES_PER_IMAGE,
     )
 
@@ -311,6 +328,8 @@ def _generate_scene_for_block(
     *,
     story_title: str,
     story_summary: str,
+    reading_level: str,
+    grade_style: Optional[dict],
     refs: Dict[str, Any],
     scope: str,
 ) -> Optional[str]:
@@ -324,8 +343,9 @@ def _generate_scene_for_block(
         page_text,
         story_title=story_title,
         story_summary=story_summary,
-        character_ref=_ref_text_for_block(refs, scope, row_id, kind="character"),
-        location_ref=_ref_text_for_block(refs, scope, row_id, kind="location"),
+        character_ref=_ref_text_for_block(refs, scope, row_id),
+        style_scene=_get_style_scene(scope),
+        grade_scene_settings=grade_scene_settings_for_prompt(reading_level, grade_style),
         page_range_label=block.get("page_range_label") or "",
     )
 
@@ -336,21 +356,21 @@ def _generate_block_image(
     refs: Dict[str, Any],
     scene_description: str,
     character_id: str,
-    location_id: str,
     reading_level: str,
+    style_scene: str = "",
 ) -> tuple[Optional[bytes], Optional[str]]:
     style_ref = get_approved_style_ref(refs)
     character_ref = find_character_ref_by_id(refs, character_id) if character_id else None
-    location_ref = find_location_ref_by_id(refs, location_id) if location_id else None
     controlnets = leo.build_partial_storybook_controlnets(
-        style_ref, character_ref, location_ref, model_id=model_id
+        style_ref, character_ref, None, model_id=model_id
     )
     cn_arg = controlnets if controlnets else None
     pos, neg = build_simple_leonardo_prompt(
         scene_description,
         reading_level,
+        style_scene=style_scene or None,
         character_ref=character_ref,
-        location_ref=location_ref,
+        location_ref=None,
     )
     defaults = LEONARDO_GENERATION_DEFAULTS
     return generate_image_leonardo(
@@ -379,6 +399,63 @@ def _get_pending_ref(key: str) -> Optional[Dict[str, Any]]:
 
 def _set_pending_ref(key: str, payload: Dict[str, Any]) -> None:
     st.session_state[key] = payload
+
+
+def _refs_with_style_cleared(refs: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "style": None,
+        "characters": list(refs.get("characters") or []),
+        "locations": list(refs.get("locations") or []),
+    }
+
+
+def _remove_saved_style_reference(
+    sb,
+    story_id: int,
+    reading_level: str,
+    refs: Dict[str, Any],
+    scope: str,
+) -> bool:
+    cleared = _refs_with_style_cleared(refs)
+    if not save_storybook_references(sb, story_id, reading_level, cleared):
+        return False
+    refs.clear()
+    refs.update(cleared)
+    _pop_pending_ref(_pending_ref_key(scope, "style"))
+    _stash_storybook_refs(scope, refs)
+    _bump_ip_cache_version()
+    return True
+
+
+def _generate_style_ref_preview(
+    scope: str,
+    *,
+    api_key: str,
+    model_id: str,
+    reading_level: str,
+) -> bool:
+    prompt = _get_style_scene(scope)
+    if not prompt:
+        st.warning("Enter or generate a style scene description first.")
+        return False
+    with st.spinner("Generating style reference…"):
+        img, _cost, gen_id = generate_leonardo_reference_preview(
+            prompt, api_key=api_key, model_id=model_id, reading_level=reading_level
+        )
+    if not img:
+        st.error("Style reference generation failed.")
+        return False
+    sk = _pending_ref_key(scope, "style")
+    _set_pending_ref(
+        sk,
+        {
+            "bytes": img,
+            "generated_image_id": gen_id,
+            "label": st.session_state.get(f"ip_style_label_{scope}", "Series style"),
+            "prompt": prompt,
+        },
+    )
+    return True
 
 
 def _approve_style_reference(
@@ -456,6 +533,123 @@ def _approve_list_reference(
     return False
 
 
+def _render_style_scene_section(
+    sb,
+    story_id: int,
+    reading_level: str,
+    scope: str,
+    refs: Dict[str, Any],
+    *,
+    story_meta: Dict[str, str],
+    grade_style: Optional[dict],
+    image_blocks: List[dict],
+    api_key: str,
+    model_id: str,
+) -> Dict[str, Any]:
+    _seed_grade_prompt_defaults(scope, reading_level)
+    st.header("2. Story style scene")
+    st.caption(
+        "ChatGPT reads the **full story** plus your **grade default scene settings** and writes one "
+        "style scene description. This text is sent to Leonardo with every illustration and used for the optional style reference image."
+    )
+
+    grade_settings = grade_scene_settings_for_prompt(reading_level, grade_style)
+    with st.expander("Grade default scene settings (ChatGPT uses these as a baseline)"):
+        st.text(grade_settings or "(No grade settings found.)")
+
+    style_scene_key = _style_scene_session_key(scope)
+    openai_client = get_openai()
+    gen_col, _ = st.columns([1, 3])
+    with gen_col:
+        if not openai_client:
+            st.caption("Set **OPENAI_API_KEY** in `.env` to generate.")
+        elif image_blocks and st.button(
+            "Generate from full story",
+            key="ip_gen_style_scene",
+            type="primary",
+        ):
+            with st.spinner("ChatGPT: reading full story and writing style scene…"):
+                style_scene = _generate_style_scene_for_story(
+                    image_blocks,
+                    story_title=story_meta["title"],
+                    story_summary=story_meta["description"],
+                    reading_level=reading_level,
+                    grade_style=grade_style,
+                )
+            if style_scene:
+                st.session_state[style_scene_key] = style_scene
+                st.success("Style scene generated. Review below, then generate illustration moments in section 4.")
+                st.rerun()
+            else:
+                st.error("Could not generate style scene. Check OPENAI_API_KEY and that the story has page text.")
+
+    st.text_area(
+        "Style scene description",
+        key=style_scene_key,
+        height=140,
+        help="Story-specific visual world for Leonardo: places, lighting, age-appropriate mood.",
+    )
+
+    st.subheader("Style reference image (optional)")
+    st.caption("Generate a reference image from the style scene above. Regenerate until you are happy, then approve.")
+    sk = _pending_ref_key(scope, "style")
+    pending = _get_pending_ref(sk)
+    approved_style = get_saved_style_ref(refs)
+    st.text_input("Label", value="Series style", key=f"ip_style_label_{scope}")
+
+    if approved_style and not pending:
+        st.image(approved_style["url"], caption=approved_style.get("label") or "Series style", width=200)
+        rm_col, rep_col = st.columns(2)
+        with rm_col:
+            if st.button("Remove style reference", key=f"ip_ref_del_style_{scope}"):
+                if _remove_saved_style_reference(sb, story_id, reading_level, refs, scope):
+                    st.success("Style reference removed.")
+                    st.rerun()
+                else:
+                    st.error("Failed to remove style reference.")
+        with rep_col:
+            if st.button("Replace style image", key=f"ip_ref_replace_style_{scope}"):
+                if not api_key:
+                    st.error("Set LEONARDO_API_KEY in .env.")
+                elif _remove_saved_style_reference(sb, story_id, reading_level, refs, scope):
+                    if _generate_style_ref_preview(
+                        scope, api_key=api_key, model_id=model_id, reading_level=reading_level
+                    ):
+                        st.rerun()
+    elif pending:
+        st.image(pending["bytes"], caption="Style preview (pending — approve or regenerate)", width=200)
+        if pending.get("generated_image_id"):
+            st.caption(f"Leonardo id: {pending['generated_image_id']}")
+        b1, b2, b3 = st.columns(3)
+        with b1:
+            if st.button("Regenerate", key=f"ip_style_regen_{scope}"):
+                if not api_key:
+                    st.error("Set LEONARDO_API_KEY in .env.")
+                elif _generate_style_ref_preview(
+                    scope, api_key=api_key, model_id=model_id, reading_level=reading_level
+                ):
+                    st.rerun()
+        with b2:
+            if st.button("Approve", key=f"ip_style_appr_{scope}", type="primary"):
+                if _approve_style_reference(sb, story_id, reading_level, refs, pending, scope):
+                    st.success("Style reference saved.")
+                    st.rerun()
+        with b3:
+            if st.button("Discard", key=f"ip_style_disc_{scope}"):
+                _pop_pending_ref(sk)
+                st.rerun()
+    else:
+        if st.button("Generate style image", key=f"ip_style_gen_{scope}"):
+            if not api_key:
+                st.error("Set LEONARDO_API_KEY in .env.")
+            elif _generate_style_ref_preview(
+                scope, api_key=api_key, model_id=model_id, reading_level=reading_level
+            ):
+                st.rerun()
+
+    return refs
+
+
 def _render_reference_library(
     sb,
     story_id: int,
@@ -465,70 +659,13 @@ def _render_reference_library(
     model_id: str,
 ) -> Dict[str, Any]:
     scope = _scope_key(story_id, reading_level)
-    _seed_grade_prompt_defaults(scope, reading_level)
-    st.header("2. Reference images (optional)")
+    st.header("3. Character references (optional)")
     st.caption(
-        "Add style, character, and location references for this story and grade. "
-        "Prompts below are pre-filled from grade presets (editable). "
+        "Add character references for this story and grade. "
         "Generate a preview, approve to save, then optionally pick them when generating scenes."
     )
 
-    # --- Style (0 or 1) ---
-    st.subheader("Style reference")
-    approved_style = get_saved_style_ref(refs)
-    if approved_style:
-        st.image(approved_style["url"], caption=approved_style.get("label") or "Series style", width=200)
-        if st.button("Remove style reference", key=f"ip_ref_del_style_{scope}"):
-            refs["style"] = None
-            if save_storybook_references(sb, story_id, reading_level, refs):
-                _bump_ip_cache_version()
-                st.rerun()
-    else:
-        sk = _pending_ref_key(scope, "style")
-        pending = _get_pending_ref(sk)
-        st.text_input("Label", value="Series style", key=f"ip_style_label_{scope}")
-        st.text_area("Prompt", key=f"ip_style_prompt_{scope}", height=120)
-        c1, c2, c3 = st.columns(3)
-        with c1:
-            if st.button("Generate", key=f"ip_style_gen_{scope}"):
-                if not api_key:
-                    st.error("Set LEONARDO_API_KEY in .env.")
-                else:
-                    prompt = (st.session_state.get(f"ip_style_prompt_{scope}") or "").strip()
-                    if not prompt:
-                        st.warning("Enter a prompt.")
-                    else:
-                        with st.spinner("Generating style reference…"):
-                            img, cost, gen_id = generate_leonardo_reference_preview(
-                                prompt, api_key=api_key, model_id=model_id, reading_level=reading_level
-                            )
-                        if img:
-                            _set_pending_ref(
-                                sk,
-                                {
-                                    "bytes": img,
-                                    "generated_image_id": gen_id,
-                                    "label": st.session_state.get(f"ip_style_label_{scope}", "Series style"),
-                                    "prompt": prompt,
-                                },
-                            )
-                            st.rerun()
-        if pending:
-            st.image(pending["bytes"], caption="Style preview (pending)", width=200)
-            if pending.get("generated_image_id"):
-                st.caption(f"Leonardo id: {pending['generated_image_id']}")
-            with c2:
-                if st.button("Approve", key=f"ip_style_appr_{scope}", type="primary"):
-                    if _approve_style_reference(sb, story_id, reading_level, refs, pending, scope):
-                        st.success("Style reference saved.")
-                        st.rerun()
-            with c3:
-                if st.button("Discard", key=f"ip_style_disc_{scope}"):
-                    _pop_pending_ref(sk)
-                    st.rerun()
-
     # --- Characters ---
-    st.subheader("Characters")
     for entry in get_saved_character_refs(refs):
         col_a, col_b = st.columns([3, 1])
         with col_a:
@@ -537,6 +674,7 @@ def _render_reference_library(
             if st.button("Delete", key=f"ip_ref_del_char_{scope}_{entry.get('id')}"):
                 refs["characters"] = [c for c in (refs.get("characters") or []) if c.get("id") != entry.get("id")]
                 if save_storybook_references(sb, story_id, reading_level, refs):
+                    _stash_storybook_refs(scope, refs)
                     _bump_ip_cache_version()
                     st.rerun()
 
@@ -595,74 +733,6 @@ def _render_reference_library(
                 _pop_pending_ref(pk)
                 st.rerun()
 
-    # --- Locations ---
-    st.subheader("Locations")
-    for entry in get_saved_location_refs(refs):
-        col_a, col_b = st.columns([3, 1])
-        with col_a:
-            st.image(entry["url"], caption=entry.get("label") or entry.get("id"), width=160)
-        with col_b:
-            if st.button("Delete", key=f"ip_ref_del_loc_{scope}_{entry.get('id')}"):
-                refs["locations"] = [loc for loc in (refs.get("locations") or []) if loc.get("id") != entry.get("id")]
-                if save_storybook_references(sb, story_id, reading_level, refs):
-                    _bump_ip_cache_version()
-                    st.rerun()
-
-    loc_draft_id = st.session_state.setdefault(f"ip_loc_draft_id_{scope}", f"l_{uuid.uuid4().hex[:8]}")
-    lk = _pending_ref_key(scope, "location", loc_draft_id)
-    loc_pending = _get_pending_ref(lk)
-    st.text_input("Location name", key=f"ip_loc_label_{scope}")
-    st.text_area("Location prompt", key=f"ip_loc_prompt_{scope}", height=70)
-    lc1, lc2, lc3 = st.columns(3)
-    with lc1:
-        if st.button("Generate", key=f"ip_loc_gen_{scope}"):
-            if not api_key:
-                st.error("Set LEONARDO_API_KEY in .env.")
-            else:
-                prompt = (st.session_state.get(f"ip_loc_prompt_{scope}") or "").strip()
-                label = (st.session_state.get(f"ip_loc_label_{scope}") or "").strip()
-                if not prompt or not label:
-                    st.warning("Enter a name and prompt.")
-                else:
-                    style_cn = _style_only_controlnets(refs, model_id)
-                    if not style_cn:
-                        st.info("Approve a style reference first for location refs that match the series look.")
-                    with st.spinner("Generating location reference…"):
-                        img, cost, gen_id = generate_leonardo_reference_preview(
-                            prompt,
-                            api_key=api_key,
-                            model_id=model_id,
-                            reading_level=reading_level,
-                            controlnets=style_cn,
-                        )
-                    if img:
-                        _set_pending_ref(
-                            lk,
-                            {
-                                "bytes": img,
-                                "generated_image_id": gen_id,
-                                "label": label,
-                                "prompt": prompt,
-                                "ref_id": loc_draft_id.split("_", 1)[-1],
-                                "pending_key_id": loc_draft_id,
-                            },
-                        )
-                        st.rerun()
-    if loc_pending:
-        st.image(loc_pending["bytes"], caption="Location preview (pending)", width=160)
-        with lc2:
-            if st.button("Approve", key=f"ip_loc_appr_{scope}", type="primary"):
-                if _approve_list_reference(
-                    sb, story_id, reading_level, refs, loc_pending, scope, "locations", "location", api_key
-                ):
-                    st.session_state[f"ip_loc_draft_id_{scope}"] = f"l_{uuid.uuid4().hex[:8]}"
-                    st.success("Location reference saved.")
-                    st.rerun()
-        with lc3:
-            if st.button("Discard", key=f"ip_loc_disc_{scope}"):
-                _pop_pending_ref(lk)
-                st.rerun()
-
     return refs
 
 
@@ -670,7 +740,7 @@ def run_image_processor_view():
     st.title("Image Processor")
     st.caption(
         f"Generate one Leonardo image per {PAGES_PER_IMAGE}-page block (same URL saved on each page in the block). "
-        "Optional style/character/location references are managed below per story and grade."
+        "Optional character references are managed per story and grade."
     )
 
     sb = get_supabase()
@@ -703,12 +773,29 @@ def run_image_processor_view():
 
     scope = _scope_key(story_id, reading_level)
     grade_style = _cached_get_story_grade_style(story_id, reading_level, _v)
-    refs = _load_storybook_refs(scope, grade_style)
+    all_pages_for_review = _cached_fetch_book_pages(story_id, reading_level, language_code, _v)
+    image_blocks_review = group_pages_into_image_blocks(all_pages_for_review)
+    story_meta = _story_meta(stories, story_id)
 
+    refs = _load_storybook_refs(scope, grade_style)
     api_key_leo = (get_secret("LEONARDO_API_KEY") or "").strip()
     model_id = (get_secret("LEONARDO_MODEL_ID") or "").strip() or str(LEONARDO_GENERATION_DEFAULTS["modelId"])
     if not api_key_leo:
         st.warning("Set **LEONARDO_API_KEY** in `.env` to generate images.")
+
+    refs = _render_style_scene_section(
+        sb,
+        story_id,
+        reading_level,
+        scope,
+        refs,
+        story_meta=story_meta,
+        grade_style=grade_style,
+        image_blocks=image_blocks_review,
+        api_key=api_key_leo,
+        model_id=model_id,
+    )
+    openai_client = get_openai()
 
     refs = _render_reference_library(sb, story_id, reading_level, refs, api_key_leo, model_id)
     _stash_storybook_refs(scope, refs)
@@ -727,8 +814,7 @@ def run_image_processor_view():
     pages_missing_display = [
         r for r in pages_missing if not _resolve_page_image_url(r, _img_overlay, just_approved)
     ]
-    all_pages_for_counts = _cached_fetch_book_pages(story_id, reading_level, language_code, _v)
-    image_blocks = group_pages_into_image_blocks(all_pages_for_counts)
+    image_blocks = image_blocks_review
     missing_blocks = [b for b in image_blocks if block_needs_image(b)]
     n_pages_in_missing_blocks = sum(len(b["member_rows"]) for b in missing_blocks)
     pending = st.session_state.get("ip_pending_images", {})
@@ -751,13 +837,9 @@ def run_image_processor_view():
         st.info("No images missing for this story + reading level. You can still regenerate or review.")
 
     char_options = get_approved_character_refs(refs)
-    loc_options = get_approved_location_refs(refs)
     char_ids = [_REF_NONE] + [c["id"] for c in char_options]
-    loc_ids = [_REF_NONE] + [loc["id"] for loc in loc_options]
     char_labels = {_REF_NONE: "None", **{c["id"]: c.get("label") or c["id"] for c in char_options}}
-    loc_labels = {_REF_NONE: "None", **{loc["id"]: loc.get("label") or loc["id"] for loc in loc_options}}
 
-    all_pages_for_review = _cached_fetch_book_pages(story_id, reading_level, language_code, _v)
     for row in all_pages_for_review:
         resolved = _resolve_page_image_url(row, _img_overlay, just_approved)
         if _row_id_str(row.get("id")) in just_cleared_ids:
@@ -765,53 +847,39 @@ def run_image_processor_view():
         elif resolved:
             row["image_url"] = resolved
 
-    image_blocks_review = group_pages_into_image_blocks(all_pages_for_review)
-
-    st.header("3. Generate scene images")
+    st.header("4. Generate scene images")
     st.caption(
-        "Character and location references strongly affect output — leave as **None** unless a scene needs them. "
-        "Use **Generate all scenes from full story** to have ChatGPT plan every illustration in one pass for consistency. "
-        "Scene description is always primary."
+        "Generate a **style scene** in section 2 first. Each block needs an **illustration moment** below; "
+        "Leonardo receives the style scene plus that moment. Character references are optional."
     )
     grade_char_key = f"ip_grade_char_{scope}"
-    grade_loc_key = f"ip_grade_loc_{scope}"
     if grade_char_key not in st.session_state:
         st.session_state[grade_char_key] = _REF_NONE
-    if grade_loc_key not in st.session_state:
-        st.session_state[grade_loc_key] = _REF_NONE
-    gc1, gc2 = st.columns(2)
-    with gc1:
-        st.selectbox(
-            "Default character for new blocks",
-            options=char_ids,
-            format_func=lambda x: char_labels.get(x, x),
-            key=grade_char_key,
-        )
-    with gc2:
-        st.selectbox(
-            "Default location for new blocks",
-            options=loc_ids,
-            format_func=lambda x: loc_labels.get(x, x),
-            key=grade_loc_key,
-        )
+    st.selectbox(
+        "Default character for new blocks",
+        options=char_ids,
+        format_func=lambda x: char_labels.get(x, x),
+        key=grade_char_key,
+    )
 
     work_queue_only = st.checkbox("Work queue only (no image or pending approval)", value=False, key="ip_work_queue")
 
-    story_meta = _story_meta(stories, story_id)
-    openai_client = get_openai()
-    if not openai_client:
-        st.caption("Set **OPENAI_API_KEY** in `.env` to auto-generate scene descriptions from page text.")
-    elif image_blocks_review and st.button(
-        f"Generate all scene descriptions from full story ({len(image_blocks_review)} block(s))",
+    if not _get_style_scene(scope):
+        st.info("Generate a **style scene** in section 2 before generating images.")
+
+    if openai_client and _get_style_scene(scope) and image_blocks_review and st.button(
+        f"Generate illustration moments for all blocks ({len(image_blocks_review)})",
         key="ip_bulk_scene_gen",
-        type="primary",
     ):
-        with st.spinner("ChatGPT: reading full story and writing all scene descriptions…"):
+        with st.spinner("ChatGPT: writing illustration moments for each block…"):
             scenes_by_block = _generate_scenes_for_full_story(
                 image_blocks_review,
                 story_title=story_meta["title"],
                 story_summary=story_meta["description"],
+                reading_level=reading_level,
+                grade_style=grade_style,
                 refs=refs,
+                scope=scope,
             )
         if not scenes_by_block:
             st.error("Could not generate scene descriptions. Check OPENAI_API_KEY and try again.")
@@ -829,7 +897,7 @@ def run_image_processor_view():
                     missing.append(block.get("page_range_label") or str(bs))
             if applied == len(image_blocks_review):
                 st.success(
-                    f"Generated **{applied}** scene descriptions from the full story. "
+                    f"Generated **{applied}** illustration moments. "
                     "Review, edit if needed, then generate images."
                 )
             elif applied:
@@ -867,15 +935,15 @@ def run_image_processor_view():
                         text=f"Generating {i + 1}/{total}: pages {page_range}…",
                     )
                     scene = (st.session_state.get(f"ip_scene_{row_id}") or "").strip()
-                    char_id, loc_id = _block_char_loc_ids(scope, row_id)
+                    char_id = _block_char_id(scope, row_id)
                     img, gen_cost = _generate_block_image(
                         api_key_leo,
                         model_id,
                         refs,
                         scene,
                         char_id,
-                        loc_id,
                         reading_level,
+                        style_scene=_get_style_scene(scope),
                     )
                     if img:
                         opt = optimize_image_for_mobile(img)
@@ -942,16 +1010,18 @@ def run_image_processor_view():
             gen_scene_col, _ = st.columns([1, 3])
             with gen_scene_col:
                 if st.button(
-                    "Regenerate this block only",
+                    "Regenerate moment",
                     key=f"gen_scene_{row_id}",
-                    disabled=not openai_client,
-                    help="Regenerates just this block without re-reading the full story.",
+                    disabled=not openai_client or not _get_style_scene(scope),
+                    help="Writes an illustration moment for this block using the style scene and page text.",
                 ):
-                    with st.spinner("ChatGPT: writing scene description…"):
+                    with st.spinner("ChatGPT: writing illustration moment…"):
                         scene = _generate_scene_for_block(
                             block,
                             story_title=story_meta["title"],
                             story_summary=story_meta["description"],
+                            reading_level=reading_level,
+                            grade_style=grade_style,
                             refs=refs,
                             scope=scope,
                         )
@@ -961,30 +1031,21 @@ def run_image_processor_view():
                     else:
                         st.error("Could not generate scene description.")
             st.text_area(
-                "Scene Description",
+                "Illustration moment",
                 key=scene_key,
                 height=100,
-                help="Visual scene for Leonardo — edit freely. Auto-filled from page text until you generate or edit.",
+                help="What happens in this illustration (action and composition). Leonardo also receives the style scene from section 2.",
             )
 
             char_key = f"ip_char_{row_id}"
-            loc_key = f"ip_loc_{row_id}"
             if char_key not in st.session_state:
                 st.session_state[char_key] = st.session_state.get(grade_char_key, _REF_NONE)
-            if loc_key not in st.session_state:
-                st.session_state[loc_key] = st.session_state.get(grade_loc_key, _REF_NONE)
 
             st.selectbox(
                 "Character",
                 options=char_ids,
                 format_func=lambda x: char_labels.get(x, x),
                 key=char_key,
-            )
-            st.selectbox(
-                "Location",
-                options=loc_ids,
-                format_func=lambda x: loc_labels.get(x, x),
-                key=loc_key,
             )
 
             img_col, act_col = st.columns([1, 1])
@@ -1009,10 +1070,12 @@ def run_image_processor_view():
                         st.error("Set LEONARDO_API_KEY in .env.")
                     else:
                         scene = (st.session_state.get(scene_key) or "").strip()
-                        if not scene:
-                            st.warning("Enter a scene description.")
+                        if not _get_style_scene(scope):
+                            st.warning("Generate a style scene in section 2 first.")
+                        elif not scene:
+                            st.warning("Enter an illustration moment.")
                         else:
-                            char_id, loc_id = _block_char_loc_ids(scope, row_id)
+                            char_id = _block_char_id(scope, row_id)
                             with st.spinner("Leonardo: generating…"):
                                 img, gen_cost = _generate_block_image(
                                     api_key_leo,
@@ -1020,8 +1083,8 @@ def run_image_processor_view():
                                     refs,
                                     scene,
                                     char_id,
-                                    loc_id,
                                     reading_level,
+                                    style_scene=_get_style_scene(scope),
                                 )
                             if img:
                                 opt = optimize_image_for_mobile(img)

@@ -113,17 +113,119 @@ def merge_negative_additions(data: Dict[str, Any]) -> str:
     return (data.get("negative_additions") or "").strip()
 
 
-SCENE_PARAGRAPH_INSTRUCTION = f"""Turn the combined page text into ONE visual scene description for an image generator.
+def _format_full_story_pages(blocks: Sequence[Dict[str, Any]]) -> str:
+    """Flatten all pages in order for a single full-story prompt."""
+    pages: List[tuple[int, str]] = []
+    for block in blocks:
+        for page in block.get("pages") or []:
+            pn = page.get("page_number")
+            text = (page.get("text") or "").strip()
+            if text and pn is not None:
+                try:
+                    pages.append((int(pn), text))
+                except (TypeError, ValueError):
+                    pages.append((0, text))
+        if not block.get("pages"):
+            combined = (block.get("combined_text") or "").strip()
+            if combined:
+                bs = block.get("block_start")
+                try:
+                    pages.append((int(bs) if bs is not None else 0, combined))
+                except (TypeError, ValueError):
+                    pages.append((0, combined))
+    pages.sort(key=lambda x: x[0])
+    return "\n\n".join(f"Page {pn}: {text}" for pn, text in pages)
+
+
+STYLE_SCENE_INSTRUCTION = f"""Write ONE style scene description for Leonardo image generation for this children's Bible storybook.
 
 {SCENE_HARD_RULES}
 
-Write a single paragraph (2–4 sentences, ~40–80 words) that describes what the illustration should show:
-- Who is visible, what they are doing, where they stand, and key props
-- Camera/framing in plain words (wide shot, close-up, etc.)
-- Time of day, weather, and setting details when relevant
-- Do NOT include art-style words (no "watercolor", "storybook style", etc.) — style is handled separately
-- Do NOT quote or repeat the page text verbatim — translate narrative into a visible moment
-- If multiple pages are combined, pick ONE cohesive moment that best represents all of them
+You are given:
+1) DEFAULT STYLE SCENE SETTINGS — age-appropriate visual rules for this reading level
+2) The FULL STORY — read it to learn where the story takes place
+
+Merge the default settings with story-specific settings into a single paragraph (4–6 sentences, ~100–150 words):
+- Key places and environments from the story (e.g. Jerusalem streets, temple courts, rock-hewn tomb, garden, hillside road)
+- Period architecture, landscape, materials, sky, and time of day for those places
+- Lighting, color palette, mood, and composition from the default grade settings
+- Age-appropriate visual tone (simple and reassuring for young readers; richer for older)
+- Describe the LOOK of the story world — not a specific plot moment or characters in action
+- This prompt will be sent to Leonardo with every illustration to keep the book visually cohesive
+
+Return only the paragraph, no labels or markdown."""
+
+
+def generate_style_scene_description(
+    openai_client,
+    blocks: Sequence[Dict[str, Any]],
+    *,
+    story_summary: str = "",
+    story_title: str = "",
+    default_style_scene: str = "",
+    grade_scene_settings: str = "",
+    model: str = "gpt-4o-mini",
+) -> Optional[str]:
+    """
+    Read the full story plus grade default style settings; return one Leonardo-ready style scene paragraph.
+    """
+    story_body = _format_full_story_pages(blocks)
+    if not story_body.strip():
+        return None
+
+    title_line = f'Story title: "{story_title}".\n' if story_title else ""
+    summary_line = (
+        f'Story summary: """{(story_summary or "").strip()[:2000]}"""\n\n'
+        if (story_summary or "").strip()
+        else ""
+    )
+    default_line = (
+        f"DEFAULT STYLE SCENE SETTINGS (merge into your output — adapt places to this story):\n"
+        f"{(default_style_scene or '').strip()[:1500]}\n\n"
+        f"Grade scene details:\n{(grade_scene_settings or '').strip()[:1500]}\n\n"
+        if (default_style_scene or "").strip() or (grade_scene_settings or "").strip()
+        else ""
+    )
+    user = (
+        f"{title_line}{summary_line}{default_line}"
+        f'FULL STORY:\n\n{story_body[:12000]}\n\n'
+        f"{STYLE_SCENE_INSTRUCTION}"
+    )
+    try:
+        resp = openai_client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a children's book art director. Create a cohesive style-and-setting "
+                        "description for an illustrated book by combining grade-level visual rules with "
+                        "places and environments from the story. "
+                        + SCENE_HARD_RULES
+                    ),
+                },
+                {"role": "user", "content": user},
+            ],
+            max_tokens=350,
+            temperature=0.35,
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        return text or None
+    except Exception:
+        return None
+
+
+SCENE_PARAGRAPH_INSTRUCTION = f"""Turn the combined page text into ONE illustration moment for Leonardo.
+
+{SCENE_HARD_RULES}
+
+The STYLE SCENE above defines the book's world and visual tone. Write one paragraph (2–4 sentences, ~40–80 words) for THIS block only:
+- Who is visible and what they are doing in this moment
+- Where they are within the story world (use places from the style scene)
+- Camera/framing in plain words
+- Do NOT repeat the full style scene — focus on this block's action
+- Do NOT quote page text verbatim
+- If multiple pages are combined, pick ONE cohesive moment
 
 Return only the paragraph, no labels or markdown."""
 
@@ -135,7 +237,8 @@ def generate_scene_description_paragraph(
     story_summary: str = "",
     story_title: str = "",
     character_ref: str = "",
-    location_ref: str = "",
+    style_scene: str = "",
+    grade_scene_settings: str = "",
     page_range_label: str = "",
     model: str = "gpt-4o-mini",
 ) -> Optional[str]:
@@ -161,13 +264,20 @@ def generate_scene_description_paragraph(
         if (character_ref or "").strip()
         else ""
     )
-    loc_line = (
-        f"Known location (if relevant): {(location_ref or '').strip()[:400]}\n"
-        if (location_ref or "").strip()
+    style_line = (
+        f"STYLE SCENE for this book (setting and visual tone — stay consistent):\n"
+        f"{(style_scene or '').strip()[:1200]}\n"
+        if (style_scene or "").strip()
+        else ""
+    )
+    grade_line = (
+        f"GRADE SCENE SETTINGS (apply lighting, mood, framing, and age-appropriate detail):\n"
+        f"{(grade_scene_settings or '').strip()[:1200]}\n"
+        if (grade_scene_settings or "").strip()
         else ""
     )
     user = (
-        f"{title_line}{summary_line}{range_line}{char_line}{loc_line}"
+        f"{title_line}{summary_line}{style_line}{grade_line}{range_line}{char_line}"
         f'Combined page text: """{(page_text or "").strip()[:4000]}"""\n\n'
         f"{SCENE_PARAGRAPH_INSTRUCTION}"
     )
@@ -221,17 +331,21 @@ def _full_story_scenes_instruction(pages_per_image: int) -> str:
 
 {SCENE_HARD_RULES}
 
+Read the ENTIRE story first. Infer real settings and places from the narrative (e.g. Jerusalem streets, temple courts, rocky tomb entrance, desert road, village courtyard).
+
 The story is split into blocks below. Each block becomes ONE illustration covering those pages ({pages_per_image} pages share each image).
 
-For EACH block, write one scene description paragraph (2–4 sentences, ~40–80 words):
-- Who is visible, what they are doing, where they stand, and key props
-- Camera/framing in plain words (wide shot, close-up, etc.)
-- Time of day, weather, and setting details when relevant
-- Do NOT include art-style words (no "watercolor", "storybook style", etc.)
-- Do NOT quote or repeat page text verbatim — translate narrative into a visible moment
-- If a block has multiple pages, pick ONE cohesive moment that best represents them
-- Use the FULL story context: keep each named character's appearance and clothing consistent across blocks
-- Vary compositions and settings — avoid repeating the same framing in consecutive blocks
+Apply the GRADE SCENE SETTINGS for audience, lighting, mood, color palette, and framing on every scene.
+
+For EACH block, write one illustration moment paragraph (2–4 sentences, ~40–80 words):
+- Who is visible and what they are doing in this moment
+- Where within the story world (consistent with the STYLE SCENE)
+- Camera/framing in plain words
+- Do NOT repeat the full style scene — focus on this block's action
+- Do NOT quote page text verbatim
+- If a block has multiple pages, pick ONE cohesive moment
+- Keep each named character's appearance consistent across blocks
+- Vary compositions across blocks
 
 Return JSON only with this exact shape (one entry per block, every block_start included):
 {{"scenes": [{{"block_start": <int>, "scene_description": "<paragraph>"}}, ...]}}
@@ -245,7 +359,8 @@ def generate_all_scene_descriptions(
     story_summary: str = "",
     story_title: str = "",
     character_refs: str = "",
-    location_refs: str = "",
+    style_scene: str = "",
+    grade_scene_settings: str = "",
     pages_per_image: int = 3,
     model: str = "gpt-4o-mini",
 ) -> Optional[Dict[int, str]]:
@@ -270,13 +385,20 @@ def generate_all_scene_descriptions(
         if (character_refs or "").strip()
         else ""
     )
-    loc_line = (
-        f"Known locations (use when relevant):\n{(location_refs or '').strip()[:1000]}\n\n"
-        if (location_refs or "").strip()
+    style_line = (
+        f"STYLE SCENE for this book (every illustration shares this world and visual tone):\n"
+        f"{(style_scene or '').strip()[:1500]}\n\n"
+        if (style_scene or "").strip()
+        else ""
+    )
+    grade_line = (
+        f"GRADE SCENE SETTINGS (apply to every illustration — audience, lighting, mood, palette, framing):\n"
+        f"{(grade_scene_settings or '').strip()[:1500]}\n\n"
+        if (grade_scene_settings or "").strip()
         else ""
     )
     user = (
-        f"{title_line}{summary_line}{char_line}{loc_line}"
+        f"{title_line}{summary_line}{style_line}{grade_line}{char_line}"
         f"FULL STORY BY ILLUSTRATION BLOCK:\n\n{story_body}\n\n"
         f"{_full_story_scenes_instruction(pages_per_image)}"
     )
@@ -296,7 +418,7 @@ def generate_all_scene_descriptions(
                 {"role": "user", "content": user},
             ],
             response_format={"type": "json_object"},
-            max_tokens=min(16000, 180 * n_blocks + 400),
+            max_tokens=min(16000, 200 * n_blocks + 400),
             temperature=0.35,
         )
         text = resp.choices[0].message.content
