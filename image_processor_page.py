@@ -12,6 +12,8 @@ from grade_style_defaults import (
     series_style_prompt_for_grade,
 )
 from leonardo_series_config import LEONARDO_GENERATION_DEFAULTS
+from scene_prompts import generate_all_scene_descriptions, generate_scene_description_paragraph
+from translator_page import get_openai
 from lib import (
     IMAGE_PROCESSOR_GRADES,
     PAGES_PER_IMAGE,
@@ -219,6 +221,113 @@ def _blocks_ready_for_bulk_generate(
             continue
         ready.append(block)
     return ready
+
+
+def _story_meta(stories: list, story_id: int) -> Dict[str, str]:
+    for s in stories:
+        if s.get("id") == story_id:
+            return {
+                "title": (s.get("title") or "").strip(),
+                "description": (s.get("description") or "").strip(),
+            }
+    return {"title": "", "description": ""}
+
+
+def _ref_text_for_block(
+    refs: Dict[str, Any], scope: str, row_id, *, kind: str
+) -> str:
+    if kind == "character":
+        char_id, _ = _block_char_loc_ids(scope, row_id)
+        ref = find_character_ref_by_id(refs, char_id) if char_id else None
+    else:
+        _, loc_id = _block_char_loc_ids(scope, row_id)
+        ref = find_location_ref_by_id(refs, loc_id) if loc_id else None
+    if not ref:
+        return ""
+    label = (ref.get("label") or "").strip()
+    prompt = (ref.get("prompt") or "").strip()
+    if label and prompt:
+        return f"{label}: {prompt}"
+    return label or prompt
+
+
+def _all_refs_text(refs: Dict[str, Any], *, kind: str) -> str:
+    if kind == "character":
+        entries = get_approved_character_refs(refs)
+    else:
+        entries = get_approved_location_refs(refs)
+    lines: List[str] = []
+    for entry in entries:
+        label = (entry.get("label") or "").strip()
+        prompt = (entry.get("prompt") or "").strip()
+        if label and prompt:
+            lines.append(f"- {label}: {prompt}")
+        elif label:
+            lines.append(f"- {label}")
+    return "\n".join(lines)
+
+
+def _block_prompt_payload(block: dict) -> dict:
+    pages = []
+    for member in block.get("member_rows") or []:
+        pages.append(
+            {
+                "page_number": page_number_for_row(member),
+                "text": _get_page_text(member),
+            }
+        )
+    return {
+        "block_start": block.get("block_start"),
+        "page_range_label": block.get("page_range_label") or "",
+        "combined_text": block.get("combined_text") or "",
+        "pages": pages,
+    }
+
+
+def _generate_scenes_for_full_story(
+    blocks: List[dict],
+    *,
+    story_title: str,
+    story_summary: str,
+    refs: Dict[str, Any],
+) -> Optional[Dict[int, str]]:
+    client = get_openai()
+    if not client or not blocks:
+        return None
+    payloads = [_block_prompt_payload(b) for b in blocks]
+    return generate_all_scene_descriptions(
+        client,
+        payloads,
+        story_title=story_title,
+        story_summary=story_summary,
+        character_refs=_all_refs_text(refs, kind="character"),
+        location_refs=_all_refs_text(refs, kind="location"),
+        pages_per_image=PAGES_PER_IMAGE,
+    )
+
+
+def _generate_scene_for_block(
+    block: dict,
+    *,
+    story_title: str,
+    story_summary: str,
+    refs: Dict[str, Any],
+    scope: str,
+) -> Optional[str]:
+    client = get_openai()
+    if not client:
+        return None
+    row_id = block["anchor_row"].get("id")
+    page_text = block.get("combined_text") or ""
+    return generate_scene_description_paragraph(
+        client,
+        page_text,
+        story_title=story_title,
+        story_summary=story_summary,
+        character_ref=_ref_text_for_block(refs, scope, row_id, kind="character"),
+        location_ref=_ref_text_for_block(refs, scope, row_id, kind="location"),
+        page_range_label=block.get("page_range_label") or "",
+    )
 
 
 def _generate_block_image(
@@ -661,6 +770,7 @@ def run_image_processor_view():
     st.header("3. Generate scene images")
     st.caption(
         "Character and location references strongly affect output — leave as **None** unless a scene needs them. "
+        "Use **Generate all scenes from full story** to have ChatGPT plan every illustration in one pass for consistency. "
         "Scene description is always primary."
     )
     grade_char_key = f"ip_grade_char_{scope}"
@@ -686,6 +796,50 @@ def run_image_processor_view():
         )
 
     work_queue_only = st.checkbox("Work queue only (no image or pending approval)", value=False, key="ip_work_queue")
+
+    story_meta = _story_meta(stories, story_id)
+    openai_client = get_openai()
+    if not openai_client:
+        st.caption("Set **OPENAI_API_KEY** in `.env` to auto-generate scene descriptions from page text.")
+    elif image_blocks_review and st.button(
+        f"Generate all scene descriptions from full story ({len(image_blocks_review)} block(s))",
+        key="ip_bulk_scene_gen",
+        type="primary",
+    ):
+        with st.spinner("ChatGPT: reading full story and writing all scene descriptions…"):
+            scenes_by_block = _generate_scenes_for_full_story(
+                image_blocks_review,
+                story_title=story_meta["title"],
+                story_summary=story_meta["description"],
+                refs=refs,
+            )
+        if not scenes_by_block:
+            st.error("Could not generate scene descriptions. Check OPENAI_API_KEY and try again.")
+        else:
+            applied = 0
+            missing: List[str] = []
+            for block in image_blocks_review:
+                bs = block.get("block_start")
+                row_id = block["anchor_row"].get("id")
+                scene = scenes_by_block.get(bs) if bs is not None else None
+                if scene:
+                    st.session_state[f"ip_scene_{row_id}"] = scene
+                    applied += 1
+                else:
+                    missing.append(block.get("page_range_label") or str(bs))
+            if applied == len(image_blocks_review):
+                st.success(
+                    f"Generated **{applied}** scene descriptions from the full story. "
+                    "Review, edit if needed, then generate images."
+                )
+            elif applied:
+                st.warning(
+                    f"Generated **{applied}/{len(image_blocks_review)}** scene descriptions. "
+                    f"Missing blocks: {', '.join(missing)} — use per-block regenerate or try again."
+                )
+            else:
+                st.error("ChatGPT returned no usable scene descriptions.")
+            st.rerun()
 
     bulk_ready = _blocks_ready_for_bulk_generate(image_blocks_review, pending, scope)
     if bulk_ready:
@@ -784,8 +938,34 @@ def run_image_processor_view():
 
             scene_key = f"ip_scene_{row_id}"
             if scene_key not in st.session_state:
-                st.session_state[scene_key] = page_text or ""
-            st.text_area("Scene Description", key=scene_key, height=100)
+                st.session_state[scene_key] = ""
+            gen_scene_col, _ = st.columns([1, 3])
+            with gen_scene_col:
+                if st.button(
+                    "Regenerate this block only",
+                    key=f"gen_scene_{row_id}",
+                    disabled=not openai_client,
+                    help="Regenerates just this block without re-reading the full story.",
+                ):
+                    with st.spinner("ChatGPT: writing scene description…"):
+                        scene = _generate_scene_for_block(
+                            block,
+                            story_title=story_meta["title"],
+                            story_summary=story_meta["description"],
+                            refs=refs,
+                            scope=scope,
+                        )
+                    if scene:
+                        st.session_state[scene_key] = scene
+                        st.rerun()
+                    else:
+                        st.error("Could not generate scene description.")
+            st.text_area(
+                "Scene Description",
+                key=scene_key,
+                height=100,
+                help="Visual scene for Leonardo — edit freely. Auto-filled from page text until you generate or edit.",
+            )
 
             char_key = f"ip_char_{row_id}"
             loc_key = f"ip_loc_{row_id}"
