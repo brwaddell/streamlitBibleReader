@@ -33,12 +33,30 @@ def ui_language_select_options(versions: List[dict]) -> List[str]:
     return filtered if filtered else list(LANGUAGE_CODES)
 
 # ElevenLabs voice options (name, voice_id, description) — shared by Audio Generator and Book Pages
+ELEVENLABS_VOICE_MALE_EN = "bV9ai9Wem8olqrkR49Zw"
+ELEVENLABS_VOICE_MALE_ES = "8JVbfL6oEdmuxKn5DK2C"  # Johnny Kid
+
 VOICES_MALE = [
-    ("Hale", "nzFihrBIvB34imQBuxub", "Warm, friendly"),
-    ("Johnny Kid", "8JVbfL6oEdmuxKn5DK2C", "Serious, calm narrator"),
+    ("Earl", ELEVENLABS_VOICE_MALE_EN, "Default English male voice"),
+    ("Johnny Kid", ELEVENLABS_VOICE_MALE_ES, "Serious, calm narrator"),
     ("David", "FF7KdobWPaiR0vkcALHF", "Deep, engaging"),
     ("Father Christmas", "1wg2wOjdEWKA7yQD8Kca", "Magical storyteller"),
 ]
+
+
+def elevenlabs_voice_male_for_language(language_code: str) -> str:
+    """Default male ElevenLabs voice_id: Earl for en, Johnny Kid for es."""
+    if (language_code or "en").strip().lower() == "es":
+        return ELEVENLABS_VOICE_MALE_ES
+    return ELEVENLABS_VOICE_MALE_EN
+
+
+def male_voice_select_index_for_language(language_code: str) -> int:
+    voice_id = elevenlabs_voice_male_for_language(language_code)
+    for i, (_name, vid, _desc) in enumerate(VOICES_MALE):
+        if vid == voice_id:
+            return i
+    return 0
 VOICES_FEMALE = [
     ("Zara", "jqcCZkN6Knx8BJ5TBdYR", "Clear, natural"),
     ("Amelia", "ZF6FPAbjXT4488VcRRnw", "Enthusiastic, expressive"),
@@ -49,7 +67,7 @@ VOICES_FEMALE = [
 # Audio Generator batch: ElevenLabs quality model, fixed narrators, per-grade playback speed.
 ELEVENLABS_TTS_MODEL_ID = "eleven_multilingual_v2"
 ELEVENLABS_TTS_OUTPUT_FORMAT = "mp3_44100_128"
-ELEVENLABS_VOICE_MALE_DEFAULT = "8JVbfL6oEdmuxKn5DK2C"  # Johnny Kid
+ELEVENLABS_VOICE_MALE_DEFAULT = ELEVENLABS_VOICE_MALE_ES  # legacy alias; prefer elevenlabs_voice_male_for_language()
 ELEVENLABS_VOICE_FEMALE_DEFAULT = "jqcCZkN6Knx8BJ5TBdYR"  # Zara
 AUDIO_TTS_SPEED_BY_GRADE = {
     "grade_1": 0.75,
@@ -443,6 +461,50 @@ def _trim_leonardo_positive(text: str, max_len: int = 1480) -> str:
     return cut
 
 
+_STYLE_SCENE_ANCHOR_MAX = 220
+_LEONARDO_POSITIVE_MAX = 1480
+
+
+def _compact_style_scene_anchor(text: str, max_len: int = _STYLE_SCENE_ANCHOR_MAX) -> str:
+    """Short setting/tone hint — not the full style scene paragraph."""
+    t = " ".join((text or "").split())
+    if len(t) <= max_len:
+        return t
+    cut = t[:max_len]
+    if " " in cut:
+        return cut.rsplit(" ", 1)[0].rstrip(",; ") + "…"
+    return cut + "…"
+
+
+def _assemble_leonardo_positive(
+    protected: List[str],
+    optional: List[str],
+    max_len: int = _LEONARDO_POSITIVE_MAX,
+) -> str:
+    """Join prompt parts; protected lines are never dropped, optional lines fill remaining budget."""
+    protected_parts = [p.strip() for p in protected if (p or "").strip()]
+    optional_parts = [p.strip() for p in optional if (p or "").strip()]
+    core = "\n".join(protected_parts)
+    if len(core) > max_len:
+        return _trim_leonardo_positive(core, max_len)
+    extras: List[str] = []
+    for part in optional_parts:
+        used = len(core) + sum(len(e) + 1 for e in extras)
+        room = max_len - used - 1 - len(part)
+        if room >= 0:
+            extras.append(part)
+        elif max_len - used - 1 > 48:
+            trimmed = _trim_leonardo_positive(part, max_len - used - 1)
+            if trimmed:
+                extras.append(trimmed)
+            break
+        else:
+            break
+    if not extras:
+        return core
+    return core + "\n" + "\n".join(extras)
+
+
 def build_leonardo_prompt(
     extra_details: str,
     story_text: str,
@@ -504,6 +566,9 @@ def build_simple_leonardo_prompt(
     reading_level: Optional[str] = None,
     *,
     style_scene: Optional[str] = None,
+    has_style_controlnet: bool = False,
+    page_context: Optional[str] = None,
+    page_range_label: Optional[str] = None,
     character_ref: Optional[Dict[str, Any]] = None,
     location_ref: Optional[Dict[str, Any]] = None,
 ) -> Tuple[str, str]:
@@ -513,47 +578,65 @@ def build_simple_leonardo_prompt(
     from scene_prompts import LEONARDO_ILLUSTRATOR_LOCK, LEONARDO_POSITIVE_IMAGE_RULES
 
     g = grade_style_defaults_for(reading_level or "grade_1")
-    scene = (scene_description or "").strip()
-    parts = [
-        LEONARDO_ILLUSTRATOR_LOCK.strip(),
-        LEONARDO_POSITIVE_IMAGE_RULES,
-    ]
+    scene = (scene_description or "").strip() or "Storybook illustration scene."
     style = (style_scene or "").strip()
-    if style:
-        parts.append(f"STYLE SCENE (world, setting, and visual tone for this book): {style}")
-    parts.append(f"SCENE (this illustration — composition and action must follow this): {scene}")
+    pages = (page_context or "").strip()
+
+    protected = [
+        f"PRIMARY SCENE — composition, action, and staging must follow this exactly: {scene}",
+    ]
+    if pages:
+        range_note = f" (pages {page_range_label})" if (page_range_label or "").strip() else ""
+        protected.append(
+            f"STORY PAGES for this illustration{range_note} — depict this narrative:\n{pages[:1200]}"
+        )
     if character_ref:
         label = (character_ref.get("label") or "the character").strip()
-        parts.append(
+        protected.append(
             f"Character reference: match {label}'s face, hair, and clothing only; "
-            f"pose, action, and scene staging follow the SCENE description."
+            f"pose and action follow PRIMARY SCENE."
         )
     if location_ref:
         label = (location_ref.get("label") or "the location").strip()
-        parts.append(
-            f"Location reference: borrow background architecture and mood from {label} only; "
-            f"do not copy the empty reference composition; characters and action follow the SCENE."
+        protected.append(
+            f"Location reference: borrow background architecture from {label} only; "
+            f"action and composition follow PRIMARY SCENE."
         )
-    age = (g.get("age_appropriateness") or "").strip()
-    if age:
-        parts.append(f"Audience: {age}")
-    palette = (g.get("color_palette") or "").strip()
-    if palette:
-        parts.append(f"Colors: {palette}")
-    lighting = (g.get("lighting") or "").strip()
-    if lighting:
-        parts.append(f"Lighting: {lighting}")
-    framing = (g.get("framing") or "").strip()
-    if framing:
-        parts.append(f"Framing: {framing}")
-    parts.append("Children's storybook illustration, cohesive series, no text in image.")
-    positive = _trim_leonardo_positive("\n".join(p for p in parts if p))
+
+    optional: List[str] = [LEONARDO_POSITIVE_IMAGE_RULES]
+    # Style controlnet already carries the book look — omit long style text to avoid cloning one frame.
+    if style and not has_style_controlnet:
+        optional.append(
+            "Book setting and tone (background mood only, do not override PRIMARY SCENE): "
+            + _compact_style_scene_anchor(style)
+        )
+    elif not style:
+        age = (g.get("age_appropriateness") or "").strip()
+        if age:
+            optional.append(f"Audience: {age}")
+        palette = (g.get("color_palette") or "").strip()
+        if palette:
+            optional.append(f"Colors: {palette}")
+        lighting = (g.get("lighting") or "").strip()
+        if lighting:
+            optional.append(f"Lighting: {lighting}")
+        framing = (g.get("framing") or "").strip()
+        if framing:
+            optional.append(f"Framing: {framing}")
+
+    optional.append(LEONARDO_ILLUSTRATOR_LOCK.strip())
+    optional.append("Children's storybook illustration, no text in image.")
+
+    positive = _assemble_leonardo_positive(protected, optional)
     negative = LEONARDO_GENERATION_DEFAULTS["negative_prompt"]
     return positive, negative
 
 
 def build_leonardo_reference_prompt(
-    description: str, reading_level: Optional[str] = None
+    description: str,
+    reading_level: Optional[str] = None,
+    *,
+    ref_kind: str = "generic",
 ) -> Tuple[str, str]:
     """Prompt for generating a reference image (style / character / location), not a story scene."""
     from grade_style_defaults import grade_style_defaults_for
@@ -561,13 +644,27 @@ def build_leonardo_reference_prompt(
 
     g = grade_style_defaults_for(reading_level or "grade_1")
     desc = (description or "").strip()
-    parts = [
-        "A children's storybook illustration reference image.",
-        desc,
-        (g.get("age_appropriateness") or "").strip(),
-        "Iconic, reusable visual design, clean composition, no text in image.",
-    ]
-    positive = _trim_leonardo_positive("\n".join(p for p in parts if p))
+    age = (g.get("age_appropriateness") or "").strip()
+
+    if ref_kind == "style":
+        protected = [
+            "STYLE REFERENCE PLATE: wide establishing view — architecture, landscape, lighting, palette. "
+            "No people, no characters, no figures, no text.",
+            f"Visual world and tone: {desc}",
+        ]
+        optional: List[str] = []
+        if age:
+            optional.append(f"Audience: {age}")
+        optional.append("Children's storybook illustration.")
+        positive = _assemble_leonardo_positive(protected, optional)
+    else:
+        if ref_kind == "character":
+            lead = "Character reference portrait: single person, neutral pose, plain simple background."
+        else:
+            lead = "Storybook illustration reference image."
+        parts = [lead, desc, age, "Clean composition, no text in image."]
+        positive = _trim_leonardo_positive("\n".join(p for p in parts if p))
+
     negative = LEONARDO_GENERATION_DEFAULTS["negative_prompt"]
     return positive, negative
 
@@ -819,6 +916,10 @@ def generate_image_leonardo(
         st.error(f"Leonardo generation failed: {err or 'unknown'}")
         return None, None
     except Exception as e:
+        from leonardo_client import LeonardoCreditsExhaustedError
+
+        if isinstance(e, LeonardoCreditsExhaustedError):
+            raise
         st.error(f"Leonardo error: {e}")
         return None, None
 
@@ -830,6 +931,7 @@ def generate_leonardo_reference_preview(
     model_id: str,
     reading_level: Optional[str] = None,
     controlnets: Optional[List[Dict[str, Any]]] = None,
+    ref_kind: str = "generic",
 ) -> Tuple[Optional[bytes], Optional[str], Optional[str]]:
     """Generate a reference image. Returns (bytes, cost_caption, generated_image_id)."""
     import leonardo_client as leo
@@ -842,7 +944,7 @@ def generate_leonardo_reference_preview(
     if not text:
         st.warning("Enter a prompt first.")
         return None, None, None
-    pos, neg = build_leonardo_reference_prompt(text, reading_level)
+    pos, neg = build_leonardo_reference_prompt(text, reading_level, ref_kind=ref_kind)
     defaults = LEONARDO_GENERATION_DEFAULTS
     try:
         gen_id = leo.create_generation(
@@ -866,6 +968,10 @@ def generate_leonardo_reference_preview(
         st.error(f"Leonardo generation failed: {err or 'unknown'}")
         return None, None, None
     except Exception as e:
+        from leonardo_client import LeonardoCreditsExhaustedError
+
+        if isinstance(e, LeonardoCreditsExhaustedError):
+            raise
         st.error(f"Leonardo error: {e}")
         return None, None, None
 
@@ -907,6 +1013,11 @@ def _extract_image_from_batch_response(response) -> Optional[bytes]:
                 img.save(buf)
             return buf.getvalue()
     return None
+
+
+def pending_image_display_url(item: dict) -> str:
+    """Preview/fetch URL for a pipeline item."""
+    return (item.get("pending_image_url") or "").strip()
 
 
 def fetch_image_for_display(url: str) -> Optional[bytes]:
@@ -978,6 +1089,7 @@ STORY_STYLE_COLUMNS = [
     "leonardo_seed",
     "default_image_provider",
     "storybook_references",
+    "style_scene_text",
 ]
 
 
@@ -1243,6 +1355,16 @@ def format_page_range(block_start: int, block_end: int) -> str:
 def combined_text_for_pages(pages: List[dict]) -> str:
     parts = [_get_page_text(p) for p in pages]
     return "\n\n".join(p for p in parts if p)
+
+
+def formatted_page_text_block(member_rows: List[dict]) -> str:
+    """Labeled per-page text for prompts (ChatGPT + Leonardo)."""
+    lines: List[str] = []
+    for row in sorted(member_rows, key=page_number_for_row):
+        text = _get_page_text(row)
+        if text:
+            lines.append(f"Page {page_number_for_row(row)}: {text}")
+    return "\n".join(lines)
 
 
 def group_pages_into_image_blocks(pages: List[dict]) -> List[dict]:
@@ -1748,6 +1870,332 @@ def update_image_generation_job(
         return False
 
 
+# ---------------------------------------------------------------------------
+# Image batch pipeline (automated generation + review queue)
+# ---------------------------------------------------------------------------
+
+TABLE_IMAGE_PIPELINE_RUNS = "image_pipeline_runs"
+TABLE_IMAGE_PIPELINE_ITEMS = "image_pipeline_items"
+
+PIPELINE_RUN_ACTIVE_STATUSES = ("running", "credits_exhausted")
+PIPELINE_ITEM_ACTIVE_STATUSES = ("queued", "generating", "pending_review")
+
+PIPELINE_SCHEMA_SETUP_MSG = (
+    "Batch pipeline tables are not set up yet. In the Supabase **SQL Editor**, run:\n"
+    "1. `supabase_image_pipeline.sql`\n"
+    "2. `supabase_story_grade_styles_style_scene.sql`"
+)
+
+
+def is_pipeline_schema_missing_error(exc: BaseException) -> bool:
+    msg = str(exc).lower()
+    return (
+        "pgrst205" in msg
+        or "image_pipeline_runs" in msg
+        or "image_pipeline_items" in msg
+        or "schema cache" in msg
+    )
+
+
+def pipeline_tables_ready(supabase) -> Tuple[bool, str]:
+    """Return (True, '') if pipeline tables exist; else (False, setup message)."""
+    try:
+        supabase.table(TABLE_IMAGE_PIPELINE_RUNS).select("id").limit(1).execute()
+        return True, ""
+    except Exception as e:
+        if is_pipeline_schema_missing_error(e):
+            return False, PIPELINE_SCHEMA_SETUP_MSG
+        return False, f"Pipeline schema check failed: {e}"
+
+
+def _pipeline_now_iso() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).isoformat()
+
+
+def save_style_scene_text(
+    supabase, story_id: int, reading_level: str, style_scene_text: str
+) -> bool:
+    existing = get_story_grade_style(supabase, story_id, reading_level) or {}
+    data = {k: existing[k] for k in STORY_STYLE_COLUMNS if k in existing}
+    data["style_scene_text"] = (style_scene_text or "").strip()
+    return upsert_story_grade_style(supabase, story_id, reading_level, data)
+
+
+def get_style_scene_text(grade_style: Optional[dict]) -> str:
+    if not grade_style:
+        return ""
+    return (grade_style.get("style_scene_text") or "").strip()
+
+
+def upload_pending_block_image(
+    supabase,
+    story_id: int,
+    reading_level: str,
+    block_start: int,
+    image_bytes: bytes,
+    *,
+    item_id: Optional[str] = None,
+) -> Optional[str]:
+    from storage_r2 import upload_image
+
+    opt = optimize_image_for_mobile(image_bytes)
+    if item_id:
+        path = f"{story_id}/{reading_level}/pending/{item_id}.webp"
+    else:
+        path = f"{story_id}/{reading_level}/pending/block_{block_start}.webp"
+    return upload_image(path, opt)
+
+
+def insert_pipeline_run(
+    supabase,
+    *,
+    language_code: str = "en",
+    items_total: int = 0,
+) -> Optional[str]:
+    try:
+        r = (
+            supabase.table(TABLE_IMAGE_PIPELINE_RUNS)
+            .insert({
+                "status": "running",
+                "language_code": language_code,
+                "items_total": items_total,
+                "items_done": 0,
+                "items_failed": 0,
+            })
+            .execute()
+        )
+        rows = r.data or []
+        return str(rows[0]["id"]) if rows else None
+    except Exception as e:
+        if not is_pipeline_schema_missing_error(e):
+            st.error(f"Failed to insert pipeline run: {e}")
+        return None
+
+
+def update_pipeline_run(supabase, run_id: str, **fields) -> bool:
+    try:
+        updates = {k: v for k, v in fields.items() if v is not None}
+        updates["updated_at"] = _pipeline_now_iso()
+        supabase.table(TABLE_IMAGE_PIPELINE_RUNS).update(updates).eq("id", run_id).execute()
+        return True
+    except Exception as e:
+        if not is_pipeline_schema_missing_error(e):
+            st.error(f"Failed to update pipeline run: {e}")
+        return False
+
+
+def get_pipeline_run(supabase, run_id: str) -> Optional[dict]:
+    try:
+        r = (
+            supabase.table(TABLE_IMAGE_PIPELINE_RUNS)
+            .select("*")
+            .eq("id", run_id)
+            .limit(1)
+            .execute()
+        )
+        rows = r.data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        if not is_pipeline_schema_missing_error(e):
+            st.error(f"Failed to fetch pipeline run: {e}")
+        return None
+
+
+def get_active_pipeline_run(supabase) -> Optional[dict]:
+    try:
+        r = (
+            supabase.table(TABLE_IMAGE_PIPELINE_RUNS)
+            .select("*")
+            .in_("status", list(PIPELINE_RUN_ACTIVE_STATUSES))
+            .order("created_at", desc=True)
+            .limit(1)
+            .execute()
+        )
+        rows = r.data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        if not is_pipeline_schema_missing_error(e):
+            st.error(f"Failed to fetch active pipeline run: {e}")
+        return None
+
+
+def insert_pipeline_items(supabase, items: List[dict]) -> List[dict]:
+    if not items:
+        return []
+    try:
+        r = supabase.table(TABLE_IMAGE_PIPELINE_ITEMS).insert(items).execute()
+        return r.data or []
+    except Exception as e:
+        if not is_pipeline_schema_missing_error(e):
+            st.error(f"Failed to insert pipeline items: {e}")
+        return []
+
+
+def fetch_pipeline_item(supabase, item_id: str) -> Optional[dict]:
+    try:
+        r = (
+            supabase.table(TABLE_IMAGE_PIPELINE_ITEMS)
+            .select("*")
+            .eq("id", item_id)
+            .limit(1)
+            .execute()
+        )
+        rows = r.data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        if not is_pipeline_schema_missing_error(e):
+            st.error(f"Failed to fetch pipeline item: {e}")
+        return None
+
+
+def fetch_pipeline_items_by_run(supabase, run_id: str, *, status: Optional[str] = None) -> List[dict]:
+    try:
+        q = (
+            supabase.table(TABLE_IMAGE_PIPELINE_ITEMS)
+            .select("*")
+            .eq("run_id", run_id)
+            .order("story_id")
+            .order("reading_level")
+            .order("block_start")
+        )
+        if status:
+            q = q.eq("status", status)
+        r = q.execute()
+        return r.data or []
+    except Exception as e:
+        if not is_pipeline_schema_missing_error(e):
+            st.error(f"Failed to fetch pipeline items: {e}")
+        return []
+
+
+def fetch_next_queued_pipeline_item(supabase, run_id: str) -> Optional[dict]:
+    try:
+        r = (
+            supabase.table(TABLE_IMAGE_PIPELINE_ITEMS)
+            .select("*")
+            .eq("run_id", run_id)
+            .eq("status", "queued")
+            .order("story_id")
+            .order("reading_level")
+            .order("block_start")
+            .limit(1)
+            .execute()
+        )
+        rows = r.data or []
+        return rows[0] if rows else None
+    except Exception as e:
+        if not is_pipeline_schema_missing_error(e):
+            st.error(f"Failed to fetch next pipeline item: {e}")
+        return None
+
+
+def update_pipeline_item(supabase, item_id: str, **fields) -> bool:
+    try:
+        updates = {k: v for k, v in fields.items()}
+        updates["updated_at"] = _pipeline_now_iso()
+        supabase.table(TABLE_IMAGE_PIPELINE_ITEMS).update(updates).eq("id", item_id).execute()
+        return True
+    except Exception as e:
+        if not is_pipeline_schema_missing_error(e):
+            st.error(f"Failed to update pipeline item: {e}")
+        return False
+
+
+def has_active_pipeline_item_for_block(
+    supabase,
+    story_id: int,
+    reading_level: str,
+    language_code: str,
+    block_start: int,
+    *,
+    exclude_item_id: Optional[str] = None,
+    active_statuses: Optional[Tuple[str, ...]] = None,
+) -> bool:
+    try:
+        statuses = active_statuses or PIPELINE_ITEM_ACTIVE_STATUSES
+        r = (
+            supabase.table(TABLE_IMAGE_PIPELINE_ITEMS)
+            .select("id")
+            .eq("story_id", story_id)
+            .eq("reading_level", reading_level)
+            .eq("language_code", language_code)
+            .eq("block_start", block_start)
+            .in_("status", list(statuses))
+            .execute()
+        )
+        rows = r.data or []
+        if exclude_item_id:
+            rows = [row for row in rows if str(row.get("id")) != str(exclude_item_id)]
+        return bool(rows)
+    except Exception:
+        return False
+
+
+def fetch_pipeline_review_queue(
+    supabase,
+    *,
+    language_code: str = "en",
+    story_id: Optional[int] = None,
+) -> List[dict]:
+    try:
+        q = (
+            supabase.table(TABLE_IMAGE_PIPELINE_ITEMS)
+            .select("*")
+            .eq("status", "pending_review")
+            .eq("language_code", language_code)
+            .order("story_id")
+            .order("reading_level")
+            .order("block_start")
+        )
+        if story_id is not None:
+            q = q.eq("story_id", story_id)
+        r = q.execute()
+        return r.data or []
+    except Exception as e:
+        if not is_pipeline_schema_missing_error(e):
+            st.error(f"Failed to fetch pipeline review queue: {e}")
+        return []
+
+
+def fetch_pipeline_failed_items(
+    supabase,
+    *,
+    language_code: str = "en",
+    run_id: Optional[str] = None,
+) -> List[dict]:
+    try:
+        q = (
+            supabase.table(TABLE_IMAGE_PIPELINE_ITEMS)
+            .select("*")
+            .eq("status", "failed")
+            .eq("language_code", language_code)
+            .order("updated_at", desc=True)
+        )
+        if run_id:
+            q = q.eq("run_id", run_id)
+        r = q.execute()
+        return r.data or []
+    except Exception as e:
+        if not is_pipeline_schema_missing_error(e):
+            st.error(f"Failed to fetch failed pipeline items: {e}")
+        return []
+
+
+def append_pipeline_spend_note(supabase, run_id: str, cost_note: str) -> None:
+    if not cost_note:
+        return
+    run = get_pipeline_run(supabase, run_id)
+    if not run:
+        return
+    prev = (run.get("leonardo_spend_note") or "").strip()
+    combined = f"{prev}; {cost_note}" if prev else cost_note
+    if len(combined) > 4000:
+        combined = combined[-4000:]
+    update_pipeline_run(supabase, run_id, leonardo_spend_note=combined)
+
+
 def generate_elevenlabs_audio(
     api_key: str,
     voice_id: str,
@@ -2001,7 +2449,7 @@ def run_audio_generator_view(*, as_wizard_step: bool = False):
     else:
         ag_grade = None
 
-    # ElevenLabs: multilingual model, fixed Johnny Kid + Zara, per-grade speed (not editable in UI).
+    # ElevenLabs: multilingual model, language-specific male narrator + Zara, per-grade speed (not editable in UI).
     stability_default = 0.5
     similarity_boost_default = 0.75
     use_speaker_boost = False
@@ -2010,19 +2458,21 @@ def run_audio_generator_view(*, as_wizard_step: bool = False):
     optimize_streaming_latency = 0
     apply_text_normalization = "auto"
 
+    language_code = ag_language
+
     def _get_ag_settings_for_level(lev: str) -> dict:
         return {
             "speed": audio_tts_speed_for_grade(lev),
-            "voice_male": ELEVENLABS_VOICE_MALE_DEFAULT,
+            "voice_male": elevenlabs_voice_male_for_language(language_code),
             "voice_female": ELEVENLABS_VOICE_FEMALE_DEFAULT,
         }
 
+    male_narrator_label = "Johnny Kid" if language_code == "es" else "Earl"
     st.caption(
-        f"Narrators: **Johnny Kid** (male), **Zara** (female) · Model `{model_id}` · {output_format} · "
+        f"Narrators: **{male_narrator_label}** (male), **Zara** (female) · Model `{model_id}` · {output_format} · "
         "Speed by grade: 1 → 0.75, 2–4 → 0.8, 5 → 0.9"
     )
 
-    language_code = ag_language
     story_id_ver = story_id
     if not story_id_ver:
         st.info("Select a story.")
@@ -2169,7 +2619,7 @@ def run_audio_generator_view(*, as_wizard_step: bool = False):
                 if page_text:
                     if not _row_has_male_audio(page):
                         audio_bytes, timing = generate_elevenlabs_audio(
-                            api_key, ELEVENLABS_VOICE_MALE_DEFAULT, page_text, language_code,
+                            api_key, elevenlabs_voice_male_for_language(language_code), page_text, language_code,
                             stability=stability, similarity_boost=similarity_boost,
                             use_speaker_boost=use_speaker_boost, speed=speed,
                             model_id=model_id, output_format=output_format,
@@ -2632,6 +3082,9 @@ def run_book_pages_view():
 
     # Audio settings (for Regenerate audio)
     with st.expander("Audio settings (for Regenerate)", expanded=False):
+        if st.session_state.get("_bp_voice_lang") != language_code:
+            st.session_state["bp_voice_male"] = male_voice_select_index_for_language(language_code)
+            st.session_state["_bp_voice_lang"] = language_code
         bp_voice_male = st.selectbox(
             "Male voice",
             options=range(len(VOICES_MALE)),

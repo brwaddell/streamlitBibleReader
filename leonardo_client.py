@@ -8,6 +8,41 @@ import requests
 
 LEONARDO_API_BASE = "https://cloud.leonardo.ai/api/rest/v1"
 
+
+class LeonardoCreditsExhaustedError(RuntimeError):
+    """Raised when Leonardo balance/credits are insufficient."""
+
+
+_CREDIT_ERROR_MARKERS = (
+    "credit",
+    "balance",
+    "insufficient",
+    "payment",
+    "top up",
+    "top-up",
+    "topup",
+    "not enough",
+)
+
+
+def is_leonardo_credits_error(status_code: int, body: str) -> bool:
+    if status_code in (402, 403):
+        return True
+    lower = (body or "").lower()
+    return any(marker in lower for marker in _CREDIT_ERROR_MARKERS)
+
+
+def _raise_for_leonardo_response(r: requests.Response, context: str = "") -> None:
+    if r.ok:
+        return
+    prefix = f"{context}: " if context else ""
+    if is_leonardo_credits_error(r.status_code, r.text):
+        raise LeonardoCreditsExhaustedError(
+            f"{prefix}Leonardo API credits exhausted ({r.status_code}): {r.text[:500]}"
+        )
+    raise RuntimeError(f"{prefix}Leonardo request failed: {r.status_code} {r.text[:500]}")
+
+
 # https://docs.leonardo.ai/docs/phoenix — Phoenix 1.0 / 0.9 modelIds and Character Reference preprocessor 397
 PHOENIX_1_MODEL_ID = "de7d3faf-762f-48e0-b3b7-9d0ac3a3fcf3"
 PHOENIX_09_MODEL_ID = "6b645e3a-d64f-4341-a6d8-7a3690fbf042"
@@ -120,7 +155,7 @@ def request_init_image_slot(api_key: str, extension: str) -> Dict[str, Any]:
         json={"extension": extension},
         timeout=60,
     )
-    r.raise_for_status()
+    _raise_for_leonardo_response(r, "init-image")
     data = r.json()
     slot = data.get("uploadInitImage") or data.get("upload_init_image")
     if not slot:
@@ -166,27 +201,41 @@ def create_generation(
     w = snap_leonardo_dimension(width if width is not None else DEFAULT_LEONARDO_WIDTH)
     h = snap_leonardo_dimension(height if height is not None else DEFAULT_LEONARDO_HEIGHT)
     body: Dict[str, Any] = {
-        "prompt": prompt,
-        "modelId": model_id,
+        "prompt": (prompt or "").strip(),
+        "modelId": (model_id or "").strip(),
         "width": w,
         "height": h,
         "num_images": num_images,
-        "guidance_scale": guidance_scale,
-        "alchemy": alchemy,
-        "presetStyle": preset_style,
     }
-    ec = effective_contrast_for_model(model_id, contrast)
-    if ec is not None:
-        body["contrast"] = ec
-    if negative_prompt:
-        body["negative_prompt"] = negative_prompt
-    if seed is not None:
-        body["seed"] = int(seed)
-    if init_image_id and init_strength is not None:
-        body["init_image_id"] = init_image_id
-        body["init_strength"] = float(init_strength)
-    if controlnets:
-        body["controlnets"] = controlnets
+    if not body["prompt"]:
+        raise ValueError("Leonardo prompt is empty")
+    if not body["modelId"]:
+        raise ValueError("Leonardo modelId is empty")
+
+    if is_phoenix_model(model_id):
+        # Phoenix API: contrast + alchemy; omit legacy presetStyle/guidance_scale (cause 500s).
+        body["alchemy"] = alchemy
+        body["enhancePrompt"] = False
+        ec = effective_contrast_for_model(model_id, contrast)
+        if ec is not None:
+            body["contrast"] = ec
+        if seed is not None:
+            body["seed"] = int(seed)
+        if controlnets:
+            body["controlnets"] = controlnets
+    else:
+        body["guidance_scale"] = guidance_scale
+        body["alchemy"] = alchemy
+        body["presetStyle"] = preset_style
+        if negative_prompt:
+            body["negative_prompt"] = negative_prompt
+        if seed is not None:
+            body["seed"] = int(seed)
+        if init_image_id and init_strength is not None:
+            body["init_image_id"] = init_image_id
+            body["init_strength"] = float(init_strength)
+        if controlnets:
+            body["controlnets"] = controlnets
 
     r = requests.post(
         f"{LEONARDO_API_BASE}/generations",
@@ -195,7 +244,8 @@ def create_generation(
         timeout=120,
     )
     if not r.ok:
-        raise RuntimeError(f"Leonardo create generation failed: {r.status_code} {r.text}")
+        model_hint = "Phoenix" if is_phoenix_model(model_id) else "legacy"
+        _raise_for_leonardo_response(r, f"create generation ({model_hint}, {w}x{h})")
     data = r.json()
     job = data.get("sdGenerationJob") or data.get("sd_generation_job") or {}
     gen_id = job.get("generationId") or job.get("generation_id")
@@ -253,6 +303,28 @@ def format_generation_cost(gen: Optional[Dict[str, Any]]) -> Optional[str]:
     return None
 
 
+def parse_generation_cost_usd(gen: Optional[Dict[str, Any]]) -> Optional[float]:
+    """Extract USD amount from generation response cost object, if present."""
+    if not gen or not isinstance(gen, dict):
+        return None
+    cost = gen.get("cost")
+    if not isinstance(cost, dict):
+        return None
+    amt = cost.get("amount") or cost.get("value") or cost.get("total")
+    unit = (cost.get("unit") or cost.get("currency") or "").strip().lower()
+    if amt is None:
+        return None
+    try:
+        value = float(amt)
+    except (TypeError, ValueError):
+        return None
+    if unit in ("usd", "us dollar", "us dollars", "$", "dollar", "dollars"):
+        return value
+    if not unit:
+        return value
+    return None
+
+
 def _first_generated_image_id(gen: Optional[Dict[str, Any]]) -> Optional[str]:
     if not gen or not isinstance(gen, dict):
         return None
@@ -307,6 +379,7 @@ def build_partial_storybook_controlnets(
     location_ref: Optional[Dict[str, Any]] = None,
     *,
     model_id: str = "",
+    style_strength: Optional[str] = None,
 ) -> List[Dict[str, Any]]:
     """Build 0–3 controlnets from approved DB reference entries (all optional)."""
     from leonardo_series_config import (
@@ -316,6 +389,7 @@ def build_partial_storybook_controlnets(
     )
 
     style_pid, char_pid, loc_pid = storybook_controlnet_preprocessors_for_model(model_id)
+    style_cn_strength = style_strength or STYLE_CONTROLNET_STRENGTH
 
     cn: List[Dict[str, Any]] = []
     if style_ref:
@@ -326,7 +400,7 @@ def build_partial_storybook_controlnets(
                     "initImageId": sid,
                     "initImageType": "GENERATED",
                     "preprocessorId": style_pid,
-                    "strengthType": STYLE_CONTROLNET_STRENGTH,
+                    "strengthType": style_cn_strength,
                 }
             )
     if character_ref:

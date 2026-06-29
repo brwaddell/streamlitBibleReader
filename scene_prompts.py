@@ -215,19 +215,31 @@ def generate_style_scene_description(
         return None
 
 
-SCENE_PARAGRAPH_INSTRUCTION = f"""Turn the combined page text into ONE illustration moment for Leonardo.
+SCENE_PARAGRAPH_INSTRUCTION = f"""Turn the STORY PAGES below into ONE illustration moment for Leonardo.
 
 {SCENE_HARD_RULES}
 
-The STYLE SCENE above defines the book's world and visual tone. Write one paragraph (2–4 sentences, ~40–80 words) for THIS block only:
-- Who is visible and what they are doing in this moment
-- Where they are within the story world (use places from the style scene)
+The STYLE SCENE (if provided) is only background mood — the illustration MUST depict the story pages.
+
+Write one paragraph (2–4 sentences, ~40–80 words) for THIS block only:
+- Who is visible and what they are doing — taken from the story pages
+- Where they are within the story world
 - Camera/framing in plain words
+- Do NOT invent events not in the story pages
 - Do NOT repeat the full style scene — focus on this block's action
-- Do NOT quote page text verbatim
-- If multiple pages are combined, pick ONE cohesive moment
+- If multiple pages are combined, pick ONE cohesive moment that represents them
 
 Return only the paragraph, no labels or markdown."""
+
+
+def _compact_style_hint(text: str, max_len: int = 280) -> str:
+    t = " ".join((text or "").split())
+    if len(t) <= max_len:
+        return t
+    cut = t[:max_len]
+    if " " in cut:
+        return cut.rsplit(" ", 1)[0].rstrip(",; ") + "…"
+    return cut + "…"
 
 
 def generate_scene_description_paragraph(
@@ -249,36 +261,30 @@ def generate_scene_description_paragraph(
     if not (page_text or "").strip():
         return None
     title_line = f'Story title: "{story_title}".\n' if story_title else ""
-    summary_line = (
-        f'Story summary (context only): """{(story_summary or "").strip()[:1500]}"""\n'
-        if (story_summary or "").strip()
-        else ""
-    )
     range_line = (
-        f"This illustration covers pages {page_range_label}.\n"
+        f"This illustration covers pages {page_range_label}.\n\n"
         if page_range_label
         else ""
     )
-    char_line = (
-        f"Known characters (keep consistent): {(character_ref or '').strip()[:800]}\n"
-        if (character_ref or "").strip()
+    pages_block = f'STORY PAGES FOR THIS ILLUSTRATION:\n"""\n{(page_text or "").strip()[:4000]}\n"""\n\n'
+    summary_line = (
+        f'Story summary (context only): """{(story_summary or "").strip()[:800]}"""\n\n'
+        if (story_summary or "").strip()
         else ""
     )
     style_line = (
-        f"STYLE SCENE for this book (setting and visual tone — stay consistent):\n"
-        f"{(style_scene or '').strip()[:1200]}\n"
+        f"Style mood (background only — story pages define the action):\n"
+        f"{_compact_style_hint(style_scene)}\n\n"
         if (style_scene or "").strip()
         else ""
     )
-    grade_line = (
-        f"GRADE SCENE SETTINGS (apply lighting, mood, framing, and age-appropriate detail):\n"
-        f"{(grade_scene_settings or '').strip()[:1200]}\n"
-        if (grade_scene_settings or "").strip()
+    char_line = (
+        f"Known characters (keep consistent): {(character_ref or '').strip()[:800]}\n\n"
+        if (character_ref or "").strip()
         else ""
     )
     user = (
-        f"{title_line}{summary_line}{style_line}{grade_line}{range_line}{char_line}"
-        f'Combined page text: """{(page_text or "").strip()[:4000]}"""\n\n'
+        f"{title_line}{range_line}{pages_block}{summary_line}{style_line}{char_line}"
         f"{SCENE_PARAGRAPH_INSTRUCTION}"
     )
     try:
@@ -337,7 +343,8 @@ The story is split into blocks below. Each block becomes ONE illustration coveri
 
 Apply the GRADE SCENE SETTINGS for audience, lighting, mood, color palette, and framing on every scene.
 
-For EACH block, write one illustration moment paragraph (2–4 sentences, ~40–80 words):
+For EACH block, write one illustration moment paragraph (2–4 sentences, ~40–80 words) that depicts THAT block's story pages:
+- The action and characters must come from the page text under that block's header — do not invent unrelated scenes
 - Who is visible and what they are doing in this moment
 - Where within the story world (consistent with the STYLE SCENE)
 - Camera/framing in plain words
@@ -386,20 +393,22 @@ def generate_all_scene_descriptions(
         else ""
     )
     style_line = (
-        f"STYLE SCENE for this book (every illustration shares this world and visual tone):\n"
-        f"{(style_scene or '').strip()[:1500]}\n\n"
+        f"Style mood for all illustrations (background tone only):\n"
+        f"{_compact_style_hint(style_scene)}\n\n"
         if (style_scene or "").strip()
         else ""
     )
     grade_line = (
-        f"GRADE SCENE SETTINGS (apply to every illustration — audience, lighting, mood, palette, framing):\n"
-        f"{(grade_scene_settings or '').strip()[:1500]}\n\n"
+        f"Grade settings (audience, lighting, palette):\n"
+        f"{_compact_style_hint(grade_scene_settings, 400)}\n\n"
         if (grade_scene_settings or "").strip()
         else ""
     )
     user = (
-        f"{title_line}{summary_line}{style_line}{grade_line}{char_line}"
-        f"FULL STORY BY ILLUSTRATION BLOCK:\n\n{story_body}\n\n"
+        f"{title_line}{summary_line}"
+        f"STORY BY ILLUSTRATION BLOCK (each scene_description must match its block's page text):\n\n"
+        f"{story_body}\n\n"
+        f"{style_line}{grade_line}{char_line}"
         f"{_full_story_scenes_instruction(pages_per_image)}"
     )
     n_blocks = len(blocks)
@@ -441,3 +450,76 @@ def generate_all_scene_descriptions(
         return result or None
     except Exception:
         return None
+
+
+CHARACTER_ANALYSIS_INSTRUCTION = """Analyze whether this children's story needs ONE Leonardo character reference image for visual consistency.
+
+Return JSON only with this exact shape:
+{"needs_character_ref": true|false, "character_label": "<name or empty>", "character_prompt": "<Leonardo-ready appearance description or empty>", "reason": "<one sentence>"}
+
+Rules:
+- needs_character_ref=true only when ONE named character appears as the clear visual protagonist across most illustration blocks
+- needs_character_ref=false for landscape-only, symbolic, ensemble casts with no single anchor, or stories where the subject changes each scene
+- character_prompt: face, hair, clothing, age — ancient Near East dress, Middle Eastern appearance; 2-3 sentences max; no scene action
+- Merge grade character defaults into character_prompt when relevant
+- Never describe God or deities as human figures"""
+
+
+def analyze_character_reference_need(
+    openai_client,
+    *,
+    story_text: str,
+    style_scene: str = "",
+    grade_character_defaults: str = "",
+    blocks: Sequence[Dict[str, Any]],
+    model: str = "gpt-4o-mini",
+) -> Dict[str, Any]:
+    """
+    Decide if a character reference image is warranted. Returns dict with
+    needs_character_ref, character_label, character_prompt, reason.
+    """
+    empty = {
+        "needs_character_ref": False,
+        "character_label": "",
+        "character_prompt": "",
+        "reason": "No analysis",
+    }
+    if not openai_client or not (story_text or "").strip():
+        return empty
+
+    block_summary = _format_story_blocks_for_prompt(blocks)[:8000]
+    user = (
+        f"GRADE CHARACTER DEFAULTS:\n{(grade_character_defaults or '').strip()[:800]}\n\n"
+        f"STYLE SCENE (context only):\n{(style_scene or '').strip()[:600]}\n\n"
+        f"STORY BY BLOCK:\n{block_summary}\n\n"
+        f"{CHARACTER_ANALYSIS_INSTRUCTION}"
+    )
+    try:
+        resp = openai_client.chat.completions.create(
+            model=model,
+            messages=[
+                {
+                    "role": "system",
+                    "content": (
+                        "You are a children's book art director. "
+                        "Decide whether a single character reference image helps consistency."
+                    ),
+                },
+                {"role": "user", "content": user},
+            ],
+            max_tokens=280,
+            temperature=0.3,
+            response_format={"type": "json_object"},
+        )
+        text = (resp.choices[0].message.content or "").strip()
+        if not text:
+            return empty
+        data = json.loads(text)
+        return {
+            "needs_character_ref": bool(data.get("needs_character_ref")),
+            "character_label": (data.get("character_label") or "").strip(),
+            "character_prompt": (data.get("character_prompt") or "").strip(),
+            "reason": (data.get("reason") or "").strip(),
+        }
+    except Exception:
+        return empty

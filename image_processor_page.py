@@ -1,4 +1,7 @@
 """Image Processor: Leonardo storybook generation with optional reference library."""
+import os
+import json
+import time
 import uuid
 from typing import Any, Dict, List, Optional
 
@@ -11,7 +14,16 @@ from grade_style_defaults import (
     grade_scene_settings_for_prompt,
     series_style_prompt_for_grade,
 )
-from leonardo_series_config import LEONARDO_GENERATION_DEFAULTS
+from leonardo_series_config import LEONARDO_GENERATION_DEFAULTS, STYLE_CONTROLNET_SCENE_STRENGTH
+from image_pipeline import (
+    CREDITS_EXHAUSTED_ERROR,
+    approve_pipeline_item,
+    create_pipeline_run,
+    discover_work_items,
+    requeue_pipeline_item,
+    resume_pipeline,
+    run_pipeline,
+)
 from scene_prompts import (
     generate_all_scene_descriptions,
     generate_scene_description_paragraph,
@@ -27,9 +39,16 @@ from lib import (
     combined_text_for_pages,
     fetch_book_pages,
     fetch_pages_missing_images,
+    fetch_pipeline_failed_items,
+    fetch_pipeline_review_queue,
+    get_active_pipeline_run,
+    pipeline_tables_ready,
+    PIPELINE_SCHEMA_SETUP_MSG,
+    update_pipeline_item,
     fetch_stories,
     find_character_ref_by_id,
     find_image_block_for_row_id,
+    formatted_page_text_block,
     generate_image_leonardo,
     generate_leonardo_reference_preview,
     get_approved_character_refs,
@@ -41,6 +60,7 @@ from lib import (
     group_pages_into_image_blocks,
     optimize_image_for_mobile,
     page_number_for_row,
+    pending_image_display_url,
     save_storybook_references,
     storybook_references_from_grade_style,
     upload_image_to_storage,
@@ -50,6 +70,29 @@ from lib import (
 
 _IP_CACHE_TTL = 60
 _REF_NONE = ""
+
+# region agent log
+_DEBUG_LOG_PATH = "/Users/benwaddell/cursor projects/storybook-image-processor/.cursor/debug-81a77e.log"
+_DEBUG_SESSION_ID = "81a77e"
+
+
+def _dbg_ui(run_id: str, hypothesis_id: str, location: str, message: str, data: Dict[str, Any]) -> None:
+    try:
+        os.makedirs(os.path.dirname(_DEBUG_LOG_PATH), exist_ok=True)
+        payload = {
+            "sessionId": _DEBUG_SESSION_ID,
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data,
+            "timestamp": int(time.time() * 1000),
+        }
+        with open(_DEBUG_LOG_PATH, "a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, ensure_ascii=True) + "\n")
+    except Exception:
+        pass
+# endregion
 
 
 def _row_id_str(rid) -> str:
@@ -250,6 +293,15 @@ def _all_character_refs_text(refs: Dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _block_page_text(block: dict) -> str:
+    """Per-page labeled text for this block (preferred over combined_text alone)."""
+    members = block.get("member_rows") or []
+    labeled = formatted_page_text_block(members)
+    if labeled:
+        return labeled
+    return (block.get("combined_text") or "").strip()
+
+
 def _block_prompt_payload(block: dict) -> dict:
     pages = []
     for member in block.get("member_rows") or []:
@@ -259,10 +311,11 @@ def _block_prompt_payload(block: dict) -> dict:
                 "text": _get_page_text(member),
             }
         )
+    page_text = _block_page_text(block)
     return {
         "block_start": block.get("block_start"),
         "page_range_label": block.get("page_range_label") or "",
-        "combined_text": block.get("combined_text") or "",
+        "combined_text": page_text or block.get("combined_text") or "",
         "pages": pages,
     }
 
@@ -337,7 +390,7 @@ def _generate_scene_for_block(
     if not client:
         return None
     row_id = block["anchor_row"].get("id")
-    page_text = block.get("combined_text") or ""
+    page_text = _block_page_text(block)
     return generate_scene_description_paragraph(
         client,
         page_text,
@@ -358,17 +411,26 @@ def _generate_block_image(
     character_id: str,
     reading_level: str,
     style_scene: str = "",
+    page_context: str = "",
+    page_range_label: str = "",
 ) -> tuple[Optional[bytes], Optional[str]]:
     style_ref = get_approved_style_ref(refs)
     character_ref = find_character_ref_by_id(refs, character_id) if character_id else None
     controlnets = leo.build_partial_storybook_controlnets(
-        style_ref, character_ref, None, model_id=model_id
+        style_ref,
+        character_ref,
+        None,
+        model_id=model_id,
+        style_strength=STYLE_CONTROLNET_SCENE_STRENGTH if style_ref else None,
     )
     cn_arg = controlnets if controlnets else None
     pos, neg = build_simple_leonardo_prompt(
         scene_description,
         reading_level,
         style_scene=style_scene or None,
+        has_style_controlnet=bool(style_ref),
+        page_context=page_context or None,
+        page_range_label=page_range_label or None,
         character_ref=character_ref,
         location_ref=None,
     )
@@ -440,7 +502,11 @@ def _generate_style_ref_preview(
         return False
     with st.spinner("Generating style reference…"):
         img, _cost, gen_id = generate_leonardo_reference_preview(
-            prompt, api_key=api_key, model_id=model_id, reading_level=reading_level
+            prompt,
+            api_key=api_key,
+            model_id=model_id,
+            reading_level=reading_level,
+            ref_kind="style",
         )
     if not img:
         st.error("Style reference generation failed.")
@@ -704,6 +770,7 @@ def _render_reference_library(
                             model_id=model_id,
                             reading_level=reading_level,
                             controlnets=style_cn,
+                            ref_kind="character",
                         )
                     if img:
                         _set_pending_ref(
@@ -736,6 +803,335 @@ def _render_reference_library(
     return refs
 
 
+def _render_batch_automation_section(sb, stories: List[dict]) -> None:
+    st.header("0. Batch automation")
+    st.caption(
+        "Scan all stories for missing images (grades 1–4, English), run the full pipeline "
+        "(style scene, refs, illustration moments, Leonardo), then review and approve here."
+    )
+
+    ready, setup_msg = pipeline_tables_ready(sb)
+    if not ready:
+        st.warning(setup_msg or PIPELINE_SCHEMA_SETUP_MSG)
+        with st.expander("SQL to run in Supabase", expanded=True):
+            st.markdown(
+                "Open your Supabase project → **SQL Editor** → New query, then paste and run each file from this repo:"
+            )
+            st.code("supabase_image_pipeline.sql", language=None)
+            st.code("supabase_story_grade_styles_style_scene.sql", language=None)
+        return
+
+    if "ip_batch_work_items" not in st.session_state:
+        st.session_state["ip_batch_work_items"] = None
+
+    scan_col, _ = st.columns([1, 3])
+    with scan_col:
+        if st.button("Scan all stories for missing images", key="ip_batch_scan"):
+            items = discover_work_items(sb, language_code="en")
+            # region agent log
+            _dbg_ui(
+                run_id="discover",
+                hypothesis_id="H1",
+                location="image_processor_page.py:_render_batch_automation_section",
+                message="Scan button completed",
+                data={"itemsCount": len(items)},
+            )
+            # endregion
+            st.session_state["ip_batch_work_items"] = items
+            st.rerun()
+
+    work_items = st.session_state.get("ip_batch_work_items")
+    if work_items is not None:
+        if not work_items:
+            st.info("No missing images found across all stories and grades.")
+        else:
+            total_blocks = sum(w.missing_block_count for w in work_items)
+            st.markdown(f"**{len(work_items)}** story/grade version(s) · **{total_blocks}** missing block(s)")
+            rows = [
+                {
+                    "Story": w.story_title,
+                    "ID": w.story_id,
+                    "Grade": w.reading_level.replace("_", " "),
+                    "Missing blocks": w.missing_block_count,
+                }
+                for w in work_items
+            ]
+            st.dataframe(rows, use_container_width=True, hide_index=True)
+
+    active_run = get_active_pipeline_run(sb)
+    if active_run:
+        run_id = str(active_run["id"])
+        status = active_run.get("status") or ""
+        st.markdown(
+            f"**Active run:** `{run_id[:8]}…` · status **{status}** · "
+            f"done **{active_run.get('items_done', 0)}** / **{active_run.get('items_total', 0)}** · "
+            f"failed **{active_run.get('items_failed', 0)}**"
+        )
+        if active_run.get("leonardo_spend_note"):
+            st.caption(active_run["leonardo_spend_note"][:500])
+
+        if status == "credits_exhausted":
+            st.error(active_run.get("last_error") or CREDITS_EXHAUSTED_ERROR)
+            if st.button("Resume batch", key="ip_batch_resume", type="primary"):
+                prog = st.progress(0.0, text="Resuming batch…")
+                status_box = st.empty()
+
+                def _on_progress(msg: str, done: int, total: int) -> None:
+                    frac = (done / total) if total else 0.0
+                    prog.progress(min(1.0, frac), text=msg)
+                    status_box.caption(f"{done}/{total} — {msg}")
+
+                result = resume_pipeline(sb, run_id, progress_callback=_on_progress)
+                prog.progress(1.0, text="Done")
+                if result.status == "credits_exhausted":
+                    st.error(result.last_error or CREDITS_EXHAUSTED_ERROR)
+                elif result.status == "completed":
+                    st.success(result.message or "Batch complete.")
+                    st.session_state["ip_batch_work_items"] = discover_work_items(sb, language_code="en")
+                    st.rerun()
+                else:
+                    st.warning(result.message or f"Run ended: {result.status}")
+
+        elif status == "running":
+            st.warning("A batch run has queued items remaining.")
+            if st.button("Continue batch", key="ip_batch_continue", type="primary"):
+                prog = st.progress(0.0, text="Continuing batch…")
+                status_box = st.empty()
+
+                def _on_progress_cont(msg: str, done: int, total: int) -> None:
+                    frac = (done / total) if total else 0.0
+                    prog.progress(min(1.0, frac), text=msg)
+                    status_box.caption(f"{done}/{total} — {msg}")
+
+                result = run_pipeline(sb, run_id, progress_callback=_on_progress_cont)
+                prog.progress(1.0, text="Done")
+                if result.status == "credits_exhausted":
+                    st.error(result.last_error or CREDITS_EXHAUSTED_ERROR)
+                elif result.status == "completed":
+                    st.success(result.message or "Batch complete.")
+                    st.session_state["ip_batch_work_items"] = discover_work_items(sb, language_code="en")
+                    st.rerun()
+                else:
+                    st.warning(result.message or f"Run ended: {result.status}")
+
+    if work_items:
+        total_blocks = sum(w.missing_block_count for w in work_items)
+        confirm = st.checkbox(
+            f"Confirm batch run on **{total_blocks}** missing block(s)",
+            key="ip_batch_confirm",
+        )
+        if confirm and st.button("Run batch pipeline", key="ip_batch_run", type="primary"):
+            if active_run and active_run.get("status") in ("running", "credits_exhausted"):
+                st.error("An active batch run exists. Use Continue or Resume above.")
+            else:
+                run_id = create_pipeline_run(sb, work_items, language_code="en")
+                # region agent log
+                _dbg_ui(
+                    run_id=str(run_id or "no_run"),
+                    hypothesis_id="H3",
+                    location="image_processor_page.py:_render_batch_automation_section",
+                    message="Run batch clicked",
+                    data={
+                        "workItemsCount": len(work_items),
+                        "totalBlocksRequested": total_blocks,
+                        "runIdCreated": bool(run_id),
+                    },
+                )
+                # endregion
+                if not run_id:
+                    st.error("Nothing to enqueue (missing blocks may already be in the review queue).")
+                else:
+                    prog = st.progress(0.0, text="Starting batch…")
+                    status_box = st.empty()
+
+                    def _on_progress(msg: str, done: int, total: int) -> None:
+                        frac = (done / total) if total else 0.0
+                        prog.progress(min(1.0, frac), text=msg)
+                        status_box.caption(f"{done}/{total} — {msg}")
+
+                    result = run_pipeline(sb, run_id, progress_callback=_on_progress)
+                    prog.progress(1.0, text="Done")
+                    if result.status == "credits_exhausted":
+                        st.error(result.last_error or CREDITS_EXHAUSTED_ERROR)
+                    elif result.status == "completed":
+                        st.success(
+                            f"Batch complete — **{result.items_done}** generated, "
+                            f"**{result.items_failed}** failed. Review below."
+                        )
+                        st.session_state["ip_batch_work_items"] = discover_work_items(sb, language_code="en")
+                    else:
+                        st.warning(result.message or f"Run ended: {result.status}")
+
+    st.subheader("Review queue")
+    tab_pending, tab_failed = st.tabs(["Pending approval", "Failed"])
+
+    with tab_pending:
+        review_items = fetch_pipeline_review_queue(sb, language_code="en")
+        # region agent log
+        block_counts: Dict[str, int] = {}
+        for _it in review_items:
+            _bk = f"{_it.get('story_id')}_{_it.get('reading_level')}_{_it.get('block_start')}"
+            block_counts[_bk] = block_counts.get(_bk, 0) + 1
+        _dbg_ui(
+            run_id="review-render",
+            hypothesis_id="H2",
+            location="image_processor_page.py:review_queue",
+            message="Review queue loaded",
+            data={
+                "count": len(review_items),
+                "duplicateBlocks": {k: v for k, v in block_counts.items() if v > 1},
+                "items": [
+                    {
+                        "id": str(it.get("id")),
+                        "storyId": it.get("story_id"),
+                        "readingLevel": it.get("reading_level"),
+                        "blockStart": it.get("block_start"),
+                        "status": it.get("status"),
+                        "pendingUrl": (it.get("pending_image_url") or "")[:120],
+                        "updatedAt": it.get("updated_at"),
+                    }
+                    for it in review_items
+                ],
+            },
+        )
+        # endregion
+        if not review_items:
+            st.info("No images pending approval.")
+        else:
+            story_titles = {s["id"]: s.get("title") or f"Story {s['id']}" for s in stories}
+            if st.button(f"Approve all ({len(review_items)})", key="ip_batch_approve_all", type="primary"):
+                ok = 0
+                for it in review_items:
+                    if approve_pipeline_item(sb, it, stories=stories):
+                        ok += 1
+                st.success(f"Approved **{ok}** image(s).")
+                st.session_state["ip_pages_missing_version"] = (
+                    st.session_state.get("ip_pages_missing_version", 0) + 1
+                )
+                st.rerun()
+            for it in review_items:
+                sid = it.get("story_id")
+                title = story_titles.get(sid, f"Story {sid}")
+                label = (
+                    f"{title} · {it.get('reading_level', '').replace('_', ' ')} · "
+                    f"pages {it.get('page_range_label') or it.get('block_start')}"
+                )
+                with st.expander(label, expanded=False):
+                    url = pending_image_display_url(it)
+                    if url:
+                        st.image(url, caption="Pending approval", width=320)
+                    if it.get("illustration_moment"):
+                        st.caption(it["illustration_moment"][:300])
+                    if it.get("leonardo_cost"):
+                        st.caption(it["leonardo_cost"])
+                    ac1, ac2, ac3 = st.columns(3)
+                    item_id = str(it["id"])
+                    with ac1:
+                        if st.button("Approve", key=f"ip_batch_appr_{item_id}", type="primary"):
+                            if approve_pipeline_item(sb, it, stories=stories):
+                                st.success("Approved.")
+                                st.session_state["ip_pages_missing_version"] = (
+                                    st.session_state.get("ip_pages_missing_version", 0) + 1
+                                )
+                                st.rerun()
+                            else:
+                                st.error("Approve failed.")
+                    with ac2:
+                        if st.button("Regenerate", key=f"ip_batch_regen_{item_id}"):
+                            run_id = str(it.get("run_id") or "")
+                            # region agent log
+                            _dbg_ui(
+                                run_id="regen-click",
+                                hypothesis_id="H3",
+                                location="image_processor_page.py:regenerate",
+                                message="Regenerate clicked",
+                                data={
+                                    "itemId": item_id,
+                                    "runId": run_id,
+                                    "blockStart": it.get("block_start"),
+                                    "oldPendingUrl": (it.get("pending_image_url") or "")[:120],
+                                    "updatedAt": it.get("updated_at"),
+                                },
+                            )
+                            # endregion
+                            if run_id and requeue_pipeline_item(sb, it, run_id):
+                                result = run_pipeline(sb, run_id)
+                                # region agent log
+                                refreshed = fetch_pipeline_review_queue(
+                                    sb,
+                                    language_code="en",
+                                    story_id=int(sid) if sid is not None else None,
+                                )
+                                _dbg_ui(
+                                    run_id="regen-done",
+                                    hypothesis_id="H1",
+                                    location="image_processor_page.py:regenerate",
+                                    message="Regenerate pipeline finished",
+                                    data={
+                                        "itemId": item_id,
+                                        "pipelineStatus": result.status,
+                                        "reviewItemsAfter": [
+                                            {
+                                                "id": str(r.get("id")),
+                                                "blockStart": r.get("block_start"),
+                                                "pendingUrl": (r.get("pending_image_url") or "")[:120],
+                                                "updatedAt": r.get("updated_at"),
+                                            }
+                                            for r in refreshed
+                                            if r.get("block_start") == it.get("block_start")
+                                        ],
+                                    },
+                                )
+                                # endregion
+                                if result.status == "credits_exhausted":
+                                    st.error(result.last_error or CREDITS_EXHAUSTED_ERROR)
+                                else:
+                                    st.success("Regenerated — check review queue.")
+                                st.rerun()
+                            else:
+                                st.error("Could not requeue.")
+                    with ac3:
+                        if st.button("Discard", key=f"ip_batch_disc_{item_id}"):
+                            # region agent log
+                            _dbg_ui(
+                                run_id="discard-click",
+                                hypothesis_id="H4",
+                                location="image_processor_page.py:discard",
+                                message="Discard clicked",
+                                data={
+                                    "itemId": item_id,
+                                    "blockStart": it.get("block_start"),
+                                    "pendingUrl": (it.get("pending_image_url") or "")[:120],
+                                },
+                            )
+                            # endregion
+                            update_pipeline_item(sb, item_id, status="superseded")
+                            st.rerun()
+
+    with tab_failed:
+        failed_items = fetch_pipeline_failed_items(sb, language_code="en")
+        if not failed_items:
+            st.info("No failed items.")
+        else:
+            story_titles = {s["id"]: s.get("title") or f"Story {s['id']}" for s in stories}
+            for it in failed_items:
+                sid = it.get("story_id")
+                title = story_titles.get(sid, f"Story {sid}")
+                st.markdown(
+                    f"**{title}** · {it.get('reading_level')} · pages {it.get('page_range_label')} — "
+                    f"{it.get('error_message') or 'unknown error'}"
+                )
+                if st.button("Retry", key=f"ip_batch_retry_{it['id']}"):
+                    run_id = str(it.get("run_id") or "")
+                    if run_id and requeue_pipeline_item(sb, it, run_id):
+                        result = run_pipeline(sb, run_id)
+                        if result.status == "credits_exhausted":
+                            st.error(result.last_error or CREDITS_EXHAUSTED_ERROR)
+                        st.rerun()
+
+    st.divider()
+
+
 def run_image_processor_view():
     st.title("Image Processor")
     st.caption(
@@ -752,6 +1148,8 @@ def run_image_processor_view():
     if not stories:
         st.warning("No stories found. Create stories in Supabase first.")
         return
+
+    _render_batch_automation_section(sb, stories)
 
     language_code = "en"
     st.header("1. Select story & version")
@@ -944,6 +1342,8 @@ def run_image_processor_view():
                         char_id,
                         reading_level,
                         style_scene=_get_style_scene(scope),
+                        page_context=_block_page_text(block),
+                        page_range_label=page_range,
                     )
                     if img:
                         opt = optimize_image_for_mobile(img)
@@ -1034,7 +1434,7 @@ def run_image_processor_view():
                 "Illustration moment",
                 key=scene_key,
                 height=100,
-                help="What happens in this illustration (action and composition). Leonardo also receives the style scene from section 2.",
+                help="What happens in this illustration (action and composition). Leonardo also receives the labeled page text for this block and the style scene from section 2.",
             )
 
             char_key = f"ip_char_{row_id}"
@@ -1085,6 +1485,8 @@ def run_image_processor_view():
                                     char_id,
                                     reading_level,
                                     style_scene=_get_style_scene(scope),
+                                    page_context=_block_page_text(block),
+                                    page_range_label=block.get("page_range_label") or "",
                                 )
                             if img:
                                 opt = optimize_image_for_mobile(img)

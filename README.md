@@ -49,6 +49,9 @@ Bulk image generation for storybook apps. Paste story text, split into pages, ge
    Run in the SQL Editor (once per project):
 
    - [`supabase_image_generation_jobs.sql`](supabase_image_generation_jobs.sql) – per-page Leonardo async jobs
+   - [`supabase_image_batch_jobs.sql`](supabase_image_batch_jobs.sql) – Gemini batch jobs (legacy)
+   - [`supabase_image_pipeline.sql`](supabase_image_pipeline.sql) – batch image pipeline runs + review queue
+   - [`supabase_story_grade_styles_style_scene.sql`](supabase_story_grade_styles_style_scene.sql) – `style_scene_text` on `story_grade_styles`
    - [`supabase_story_grade_styles_leonardo.sql`](supabase_story_grade_styles_leonardo.sql) – `character_reference_image_url`, `leonardo_seed`, `default_image_provider` on `story_grade_styles`
 
 7. **Optional: Per-story character/style** (Image Processor → **Settings** tab):
@@ -60,10 +63,19 @@ Bulk image generation for storybook apps. Paste story text, split into pages, ge
 
    If these columns are missing, the app uses the reading-level defaults (e.g. Noah for Bible stories).
 
+   **Image Processor → section 0 (Batch automation)** requires `image_pipeline_runs` and `image_pipeline_items` from `supabase_image_pipeline.sql`. If you see a schema error, run that file plus `supabase_story_grade_styles_style_scene.sql` in the SQL Editor, then refresh the app.
+
 ## Run
 
 ```bash
 streamlit run app.py
+```
+
+Headless batch for remaining missing images (supersedes bad pending-review items, then generates):
+
+```bash
+python3 scripts/run_image_pipeline_batch.py --scan-only
+python3 scripts/run_image_pipeline_batch.py --run
 ```
 
 ## Deploy to Streamlit Community Cloud
