@@ -22,18 +22,17 @@ Bulk image generation for storybook apps. Paste story text, split into pages, ge
    Copy `.env.example` to `.env` and fill in your keys:
 
    - `SUPABASE_URL` – your Supabase project URL
-   - `SUPABASE_ANON_KEY` – Supabase anon/public key (for auth login)
    - `SUPABASE_SERVICE_KEY` – Supabase service_role key (for database)
+   - `ADMIN_USERNAME`, `ADMIN_PASSWORD` – credentials for the app admin login
    - `OPENAI_API_KEY` – from [OpenAI](https://platform.openai.com/api-keys) (scene prompt suggestions)
    - `GEMINI_API_KEY` – from [Google AI Studio](https://aistudio.google.com/apikey) (Gemini image generation)
    - `LEONARDO_API_KEY`, `LEONARDO_MODEL_ID` – from [Leonardo.ai API](https://docs.leonardo.ai/) (optional; set Image Processor provider to Leonardo)
    - `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY` – from [Cloudflare R2](https://developers.cloudflare.com/r2/) (images + audio storage)
    - `R2_PUBLIC_URL_IMAGES`, `R2_PUBLIC_URL_AUDIO` – public URLs for your R2 buckets (e.g. `https://pub-xxx.r2.dev` or custom domain)
 
-4. **Supabase Auth**:
+4. **Admin login**:
 
-   - In Supabase Dashboard → Authentication → Providers: enable **Email**
-   - Go to Authentication → Users → Add user (email + password) for each person who should access the app
+   Set `ADMIN_USERNAME` and `ADMIN_PASSWORD` in `.env` (local) or Streamlit secrets (deployed). The app uses this single admin account as a gate; it does **not** use Supabase Auth.
 
 5. **Create Cloudflare R2 buckets**:
 
@@ -90,12 +89,13 @@ python3 scripts/run_image_pipeline_batch.py --run
    - Main file path: `app.py`
 
 4. Open **Advanced settings** and add these secrets (as key-value pairs):
-   - `SUPABASE_URL`, `SUPABASE_ANON_KEY`, `SUPABASE_SERVICE_KEY`
+   - `ADMIN_USERNAME`, `ADMIN_PASSWORD`
+   - `SUPABASE_URL`, `SUPABASE_SERVICE_KEY`
    - `OPENAI_API_KEY`, `GEMINI_API_KEY`, and if using Leonardo: `LEONARDO_API_KEY`, `LEONARDO_MODEL_ID`
    - `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`, `R2_SECRET_ACCESS_KEY`
    - `R2_PUBLIC_URL_IMAGES`, `R2_PUBLIC_URL_AUDIO`
 
-5. Click **Deploy**. The app will build and run. Only users you create in Supabase Auth can sign in.
+5. Click **Deploy**. The app will build and run. Sign in with the admin username and password from secrets.
 
 6. (Optional) Enable **Sign in required** in app settings to add another layer of access control via Streamlit accounts.
 

@@ -6,7 +6,7 @@ Gemini image generation and/or Leonardo.ai; OpenAI scene prompts; export to R2 +
 import streamlit as st
 from dotenv import load_dotenv
 
-from auth import is_authenticated, logout, run_login_page
+from auth import get_admin_username, is_authenticated, logout, run_login_page
 from grade_style_defaults import GRADE_STYLE_DEFAULTS
 from image_processor_page import run_image_processor_view
 from lib import run_book_pages_view
@@ -60,6 +60,9 @@ def main():
     init_session_state()
 
     st.sidebar.title("Storybook")
+    admin_name = get_admin_username()
+    if admin_name:
+        st.sidebar.caption(f"Signed in as **{admin_name}**")
     page = st.sidebar.radio(
         "Go to",
         [

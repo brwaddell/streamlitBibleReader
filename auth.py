@@ -1,8 +1,16 @@
-"""Supabase Auth for Storybook Image Processor."""
+"""Admin login for Storybook Image Processor.
+
+Uses a single username/password from Streamlit secrets or environment
+variables. Supabase is not used for authentication.
+"""
+import hmac
 import os
 from typing import Tuple
 
 import streamlit as st
+
+SESSION_AUTH_KEY = "admin_authenticated"
+SESSION_USER_KEY = "admin_username"
 
 
 def get_secret(key: str, default: str = "") -> str:
@@ -16,101 +24,79 @@ def get_secret(key: str, default: str = "") -> str:
     return os.getenv(key, default)
 
 
-def get_auth_client():
-    """Get Supabase client with anon key for auth (login/session)."""
-    if getattr(st.session_state, "auth_client", None) is None:
-        url = get_secret("SUPABASE_URL")
-        anon_key = get_secret("SUPABASE_ANON_KEY")
-        if not url or not anon_key:
-            return None
-        from supabase import create_client
-        client = create_client(url, anon_key)
-        # Restore session from session state (persists across Streamlit reruns)
-        tokens = st.session_state.get("auth_tokens")
-        if tokens:
-            try:
-                client.auth.set_session(tokens["access_token"], tokens["refresh_token"])
-            except Exception:
-                st.session_state.auth_tokens = None
-        st.session_state.auth_client = client
-    return st.session_state.auth_client
+def _configured_credentials() -> Tuple[str, str]:
+    username = (get_secret("ADMIN_USERNAME") or "").strip()
+    password = get_secret("ADMIN_PASSWORD") or ""
+    return username, password
 
 
-def get_session():
-    """Get current auth session if logged in."""
-    client = get_auth_client()
-    if not client:
-        return None
-    try:
-        session = client.auth.get_session()
-        if session:
-            # Persist tokens for next run
-            st.session_state.auth_tokens = {
-                "access_token": session.access_token,
-                "refresh_token": session.refresh_token,
-            }
-        return session
-    except Exception:
-        return None
+def is_auth_configured() -> bool:
+    """True when admin username and password are both set."""
+    username, password = _configured_credentials()
+    return bool(username and password)
 
 
-def get_profile_id() -> str:
-    """Get current user's profile id (auth user id) for subscription/profiles lookups."""
-    session = get_session()
-    if not session or not session.user:
-        return ""
-    return str(session.user.id) if session.user.id else ""
+def credentials_match(username: str, password: str, expected_user: str, expected_pass: str) -> bool:
+    """Constant-time compare of submitted credentials against configured admin account."""
+    user_ok = hmac.compare_digest(username.strip().encode("utf-8"), expected_user.encode("utf-8"))
+    pass_ok = hmac.compare_digest(password.encode("utf-8"), expected_pass.encode("utf-8"))
+    return user_ok and pass_ok
 
 
 def is_authenticated() -> bool:
-    """Check if user has a valid session."""
-    return get_session() is not None
+    """Check if the current Streamlit session is signed in as admin."""
+    return bool(st.session_state.get(SESSION_AUTH_KEY))
 
 
-def login(email: str, password: str) -> Tuple[bool, str]:
-    """Sign in with email/password. Returns (success, error_message)."""
-    client = get_auth_client()
-    if not client:
-        return False, "Auth not configured (missing SUPABASE_URL or SUPABASE_ANON_KEY)."
-    try:
-        resp = client.auth.sign_in_with_password({"email": email, "password": password})
-        if resp.session:
-            st.session_state.auth_tokens = {
-                "access_token": resp.session.access_token,
-                "refresh_token": resp.session.refresh_token,
-            }
+def get_admin_username() -> str:
+    """Username of the signed-in admin, or empty if not authenticated."""
+    if not is_authenticated():
+        return ""
+    return str(st.session_state.get(SESSION_USER_KEY) or "")
+
+
+def login(username: str, password: str) -> Tuple[bool, str]:
+    """Sign in with the configured admin account. Returns (success, error_message)."""
+    expected_user, expected_pass = _configured_credentials()
+    if not expected_user or not expected_pass:
+        return False, "Admin login is not configured (set ADMIN_USERNAME and ADMIN_PASSWORD)."
+    if credentials_match(username, password, expected_user, expected_pass):
+        st.session_state[SESSION_AUTH_KEY] = True
+        st.session_state[SESSION_USER_KEY] = expected_user
         return True, ""
-    except Exception as e:
-        return False, str(e)
+    return False, "Invalid username or password."
 
 
 def logout():
-    """Sign out and clear auth state."""
-    client = get_auth_client()
-    if client:
-        try:
-            client.auth.sign_out()
-        except Exception:
-            pass
-    for key in ("auth_client", "auth_tokens"):
-        if key in st.session_state:
-            del st.session_state[key]
+    """Sign out and clear admin auth state."""
+    for key in (SESSION_AUTH_KEY, SESSION_USER_KEY):
+        st.session_state.pop(key, None)
 
 
 def run_login_page() -> bool:
     """Show login form. Returns True if successfully logged in (rerun), else False (stops)."""
     st.title("Storybook Image Processor")
-    st.caption("Sign in to continue")
+    st.caption("Admin sign in")
+
+    if not is_auth_configured():
+        st.error(
+            "Admin login is not configured. Set `ADMIN_USERNAME` and `ADMIN_PASSWORD` "
+            "in Streamlit secrets or your `.env` file."
+        )
+        return False
+
     with st.form("login"):
-        email = st.text_input("Email")
+        username = st.text_input("Username")
         password = st.text_input("Password", type="password")
         submitted = st.form_submit_button("Sign in")
-        if submitted and email and password:
-            ok, err = login(email.strip(), password)
-            if ok:
-                st.success("Signed in.")
-                st.rerun()
+        if submitted:
+            if not username or not password:
+                st.error("Enter username and password.")
             else:
-                st.error(err or "Login failed.")
-    st.caption("Create an account in Supabase Dashboard → Authentication → Users.")
+                ok, err = login(username, password)
+                if ok:
+                    st.success("Signed in.")
+                    st.rerun()
+                else:
+                    st.error(err or "Login failed.")
     return False
