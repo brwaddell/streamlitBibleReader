@@ -16,7 +16,7 @@ All story content, including translations and multiple reading levels (versions)
 - **Primary query keys**: To fetch a specific book, filter by:
   - `story_id`
   - `reading_level` (e.g. `'grade_1'`)
-  - `language_code` (e.g. `'en'`)
+  - `language_code` (`en`, `es`, `fr`, `de`, `pt`, `it`, `ar`, `zh`, `ja`)
 - **Ordering**: Always sort by **page_number** ascending to render the story in the correct sequence.
 - **Asset handling**: Each row contains the direct **image_url** and **text** (or page_text) for that page; no joins required.
 
