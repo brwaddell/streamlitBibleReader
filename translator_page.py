@@ -1,7 +1,7 @@
 """
-Translator Page: Localize existing English stories into Spanish via OpenAI.
-Select source story (English) → reading level → AI translates each page →
-side-by-side editor → save to Supabase (story_content_flat).
+Translator Page: Localize existing English stories via OpenAI.
+Select source story (English) → reading level → target language →
+AI translates each missing page → side-by-side editor → save to story_content_flat.
 """
 
 from typing import List, Optional
@@ -9,6 +9,7 @@ from typing import List, Optional
 import streamlit as st
 
 from auth import get_secret
+from languages import READING_LEVEL_LABELS, TRANSLATION_TARGET_CODES, language_label, translation_system_prompt
 from lib import (
     READING_LEVELS,
     _get_page_text,
@@ -17,20 +18,6 @@ from lib import (
     get_supabase,
     insert_book_page,
 )
-
-# Product ships Spanish only as translation target (no dropdown).
-TARGET_LANG_DISPLAY = "Spanish"
-TARGET_LANG_CODE = "es"
-TARGET_LANG_PROMPT_NAME = "Spanish"
-
-# Reading level display for prompts (friendly names)
-READING_LEVEL_LABELS = {
-    "grade_1": "Pre-K / Grade 1 (ages 3–6)",
-    "grade_2": "Grade 2 (ages 5–7)",
-    "grade_3": "Grade 3 (ages 7–8)",
-    "grade_4": "Grade 4 (ages 9–10)",
-    "grade_5": "Grade 5 (ages 11+)",
-}
 
 
 def get_openai():
@@ -54,11 +41,7 @@ def translate_page_text(
     """Call OpenAI to translate one page. Returns translated text or None."""
     if not english_text or not english_text.strip():
         return ""
-    system_prompt = (
-        f"You are a professional children's book translator. "
-        f"Translate the following text into {target_lang_name} for a {reading_level_label} audience. "
-        f"Maintain the whimsical tone, rhythm, and simplicity of the original."
-    )
+    system_prompt = translation_system_prompt(target_lang_name, reading_level_label)
     try:
         resp = client.chat.completions.create(
             model=model,
@@ -66,7 +49,7 @@ def translate_page_text(
                 {"role": "system", "content": system_prompt},
                 {"role": "user", "content": english_text.strip()},
             ],
-            max_tokens=500,
+            max_tokens=1200,
         )
         text = resp.choices[0].message.content
         return (text or "").strip()
@@ -76,8 +59,9 @@ def translate_page_text(
 
 
 def apply_translator_target_to_audio_language():
-    """Default Audio Generator language to Spanish (wizard handoff)."""
-    st.session_state["ag_language"] = TARGET_LANG_CODE
+    """Point Audio Generator at the language just translated."""
+    code = st.session_state.get("tr_target_lang") or "es"
+    st.session_state["ag_language"] = code
 
 
 def _maybe_wizard_jump_after_translate_save(next_step: Optional[str]):
@@ -96,14 +80,14 @@ def run_translator_view(
     """Render the Translator page: story + grade + target language; translate only missing rows (like Audio Generator)."""
     if as_wizard_step:
         st.caption(
-            "Source is always English. Pick story and grade level; "
-            "translations are **Spanish** only. Only pages missing a Spanish row are filled."
+            "Source is always English. Pick a story, grade, and target language. "
+            "Only pages that do not yet have a row in that language are filled."
         )
     else:
         st.title("Story Translator")
         st.caption(
-            "Source is always English. Target language is **Spanish** (`es`). "
-            "Translates only pages that don't have a Spanish row yet."
+            "Source is always English. Choose a target language. "
+            "Translates only pages that do not yet have a row in that language."
         )
 
     sb = get_supabase()
@@ -127,11 +111,14 @@ def run_translator_view(
         )
         story_id = story_options.get(story_label) if story_label else None
     with col2:
-        st.caption("Target language")
-        st.markdown(f"**{TARGET_LANG_DISPLAY}** (`{TARGET_LANG_CODE}`)")
-        target_lang_display = TARGET_LANG_DISPLAY
-        target_lang_code = TARGET_LANG_CODE
-        target_lang_prompt_name = TARGET_LANG_PROMPT_NAME
+        target_lang_code = st.selectbox(
+            "Target language",
+            options=TRANSLATION_TARGET_CODES,
+            format_func=language_label,
+            key="tr_target_lang",
+        )
+        target_lang_display = language_label(target_lang_code)
+        target_lang_prompt_name = target_lang_code
 
     tr_all_levels = st.radio(
         "Mode",

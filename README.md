@@ -121,6 +121,35 @@ Audio is stored at:
 stories/{story_id}/{language_code}/{reading_level}/{gender}/page_{page_index}.mp3
 ```
 
+Word timings from the ElevenLabs `with-timestamps` response are saved on `timing_male_json` and `timing_female_json`. The reader uses those timings for follow-along highlighting and tap-a-word playback.
+
+## Languages
+
+`story_content_flat.language_code` is plain text. Supported codes:
+
+| Code | Language |
+| --- | --- |
+| `en` | English (source) |
+| `es` | Spanish |
+| `fr` | French |
+| `de` | German |
+| `pt` | Portuguese (Brazilian in the translator prompt) |
+| `it` | Italian |
+| `ar` | Arabic (Modern Standard Arabic) |
+| `zh` | Mandarin (Simplified Chinese) |
+| `ja` | Japanese |
+
+Spanish male audio uses Johnny Kid. Every other language uses Earl for male and Zara for female, with `eleven_multilingual_v2` and the matching language code.
+
+Translate every English page that does not yet have a target row, then record missing male and female audio:
+
+```bash
+python3 scripts/localize_stories.py --dry-run
+python3 scripts/localize_stories.py
+```
+
+Use `--languages fr,de` or `--story-id 12` to narrow the run. `--translate` and `--audio` run one phase. The script skips rows that already exist, so it can be resumed.
+
 ## Custom domains (image.aptreelearning.com / audio.aptreelearning.com)
 
 Set `R2_PUBLIC_URL_IMAGES` and `R2_PUBLIC_URL_AUDIO` in `.env` to your custom domains. To update existing DB URLs to use them:

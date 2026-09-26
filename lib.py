@@ -11,6 +11,7 @@ import streamlit as st
 from PIL import Image
 
 from auth import get_secret
+from languages import LANGUAGE_CODES, elevenlabs_language_code, language_label
 from scene_prompts import (
     LEONARDO_ILLUSTRATOR_LOCK,
     LEONARDO_NEGATIVE_IMAGE_HARD_RULES,
@@ -22,14 +23,12 @@ from scene_prompts import (
 READING_LEVELS = ["grade_1", "grade_2", "grade_3", "grade_4", "grade_5"]
 IMAGE_PROCESSOR_GRADES = ("grade_1", "grade_2", "grade_3", "grade_4")
 PAGES_PER_IMAGE = 3
-# Languages offered in Story Text / Audio / Book Pages dropdowns (English + Spanish only).
-LANGUAGE_CODES = ["en", "es"]
 
 
 def ui_language_select_options(versions: List[dict]) -> List[str]:
-    """Intersect Supabase version codes with LANGUAGE_CODES; default to full UI list if none match."""
+    """Intersect Supabase version codes with LANGUAGE_CODES; default to the full UI list if none match."""
     from_db = {v.get("language_code") for v in (versions or []) if v.get("language_code")}
-    filtered = sorted(from_db & set(LANGUAGE_CODES))
+    filtered = [code for code in LANGUAGE_CODES if code in from_db]
     return filtered if filtered else list(LANGUAGE_CODES)
 
 # ElevenLabs voice options (name, voice_id, description) — shared by Audio Generator and Book Pages
@@ -45,10 +44,16 @@ VOICES_MALE = [
 
 
 def elevenlabs_voice_male_for_language(language_code: str) -> str:
-    """Default male ElevenLabs voice_id: Earl for en, Johnny Kid for es."""
+    """Male narrator: Johnny Kid for Spanish, Earl for English and the other languages."""
     if (language_code or "en").strip().lower() == "es":
         return ELEVENLABS_VOICE_MALE_ES
     return ELEVENLABS_VOICE_MALE_EN
+
+
+def male_narrator_label(language_code: str) -> str:
+    if (language_code or "en").strip().lower() == "es":
+        return "Johnny Kid"
+    return "Earl"
 
 
 def male_voice_select_index_for_language(language_code: str) -> int:
@@ -2225,7 +2230,7 @@ def generate_elevenlabs_audio(
     }
     payload = {"text": text.strip()}
     if language_code:
-        payload["language_code"] = language_code
+        payload["language_code"] = elevenlabs_language_code(language_code)
     if model_id:
         payload["model_id"] = model_id
     if apply_text_normalization:
@@ -2433,7 +2438,12 @@ def run_audio_generator_view(*, as_wizard_step: bool = False):
 
     lang_options = ui_language_select_options(versions)
     with col2:
-        ag_language = st.selectbox("Language", options=lang_options, key="ag_language")
+        ag_language = st.selectbox(
+            "Language",
+            options=lang_options,
+            format_func=language_label,
+            key="ag_language",
+        )
 
     ag_all_levels = st.radio(
         "Mode",
@@ -2467,9 +2477,9 @@ def run_audio_generator_view(*, as_wizard_step: bool = False):
             "voice_female": ELEVENLABS_VOICE_FEMALE_DEFAULT,
         }
 
-    male_narrator_label = "Johnny Kid" if language_code == "es" else "Earl"
     st.caption(
-        f"Narrators: **{male_narrator_label}** (male), **Zara** (female) · Model `{model_id}` · {output_format} · "
+        f"Narrators: **{male_narrator_label(language_code)}** (male), **Zara** (female) · "
+        f"Model `{model_id}` · {output_format} · "
         "Speed by grade: 1 → 0.75, 2–4 → 0.8, 5 → 0.9"
     )
 
@@ -2964,7 +2974,12 @@ def run_book_pages_view():
     versions = fetch_localized_versions(sb, story_id) if story_id else []
     bp_lang_options = ui_language_select_options(versions)
     with top2:
-        language_code = st.selectbox("Language", options=bp_lang_options, key="bp_language")
+        language_code = st.selectbox(
+            "Language",
+            options=bp_lang_options,
+            format_func=language_label,
+            key="bp_language",
+        )
     with top3:
         reading_level = st.selectbox("Reading Level", READING_LEVELS, key="bp_reading_level")
 

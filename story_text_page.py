@@ -8,8 +8,8 @@ from typing import Optional
 
 import streamlit as st
 
+from languages import LANGUAGE_CODES, language_label
 from lib import (
-    LANGUAGE_CODES,
     READING_LEVELS,
     delete_book_pages_for_version,
     fetch_book_pages,
@@ -62,7 +62,12 @@ def run_story_text_view(
             key="st_reading_level",
         )
     with col3:
-        language_code = st.selectbox("Language", options=LANGUAGE_CODES, key="st_language")
+        language_code = st.selectbox(
+            "Language",
+            options=LANGUAGE_CODES,
+            format_func=language_label,
+            key="st_language",
+        )
 
     if not story_id:
         st.info("Select a story to continue.")
